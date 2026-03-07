@@ -1,0 +1,248 @@
+===== core/outbox/dispatcher.py =====
+
+
+
+===== core/outbox/topic_grammar.py =====
+
+
+
+===== core/outbox/memory_store.py =====
+
+
+
+===== core/outbox/__init__.py =====
+
+
+
+===== core/outbox/backoff.py =====
+
+
+
+===== core/outbox/model.py =====
+
+
+
+===== core/outbox/store_protocol.py =====
+
+
+
+===== core/outbox/writer.py =====
+
+
+
+===== core/rbac/roles.py =====
+
+
+
+===== core/rbac/__init__.py =====
+
+
+
+===== core/rbac/grammar.py =====
+
+
+
+===== core/rbac/permissions.py =====
+
+
+
+===== core/context/accessors.py =====
+
+
+
+===== core/context/request_context.py =====
+
+
+
+===== core/context/__init__.py =====
+
+
+
+===== core/identity/__init__.py =====
+
+
+
+===== core/identity/uuid.py =====
+
+
+
+===== core/tenancy/tenant_context.py =====
+
+
+
+===== core/tenancy/tenant.py =====
+
+
+
+===== core/tenancy/__init__.py =====
+
+
+
+===== core/tenancy/grammar.py =====
+
+
+
+===== core/tenancy/resolver.py =====
+
+
+
+===== core/health/registry.py =====
+
+
+
+===== core/health/diagnostics.py =====
+
+
+
+===== core/health/__init__.py =====
+
+
+
+===== core/__init__.py =====
+
+
+
+===== core/saga/__init__.py =====
+
+
+
+===== core/saga/manager.py =====
+
+
+
+===== core/saga/state.py =====
+
+
+
+===== core/time/clock.py =====
+
+
+
+===== core/time/__init__.py =====
+
+
+
+===== core/time/hlc.py =====
+
+
+
+===== core/typing/__init__.py =====
+
+
+
+===== core/audit/storage_protocol.py =====
+
+
+
+===== core/audit/merkle.py =====
+
+
+
+===== core/audit/audit_writer.py =====
+
+
+
+===== core/audit/audit_record.py =====
+
+
+
+===== core/audit/__init__.py =====
+
+
+
+===== core/execution/transaction.py =====
+
+
+
+===== core/execution/__init__.py =====
+
+
+
+===== core/execution/strict_write.py =====
+
+
+
+===== core/execution/execution_context.py =====
+
+
+
+===== core/registry/services.py =====
+
+
+
+===== core/registry/registry.py =====
+
+
+
+===== core/registry/handlers.py =====
+
+
+
+===== core/registry/__init__.py =====
+
+
+
+===== core/registry/freeze_guard.py =====
+
+
+
+===== core/registry/base.py =====
+
+
+
+===== core/errors/__init__.py =====
+
+
+
+===== core/events/event.py =====
+
+
+
+===== core/events/__init__.py =====
+
+
+
+===== core/events/bus.py =====
+
+
+
+===== core/events/headers.py =====
+
+
+
+===== core/events/envelope.py =====
+
+
+
+===== core/guards/idempotency.py =====
+
+
+
+===== core/guards/__init__.py =====
+
+
+
+===== core/guards/circuit_breaker.py =====
+
+
+
+===== core/guards/rate_limit.py =====
+
+
+
+===== core/guards/preconditions.py =====
+
+
+
+===== core/kernel/__init__.py =====
+
+
+
+===== core/kernel/freeze.py =====
+
+
+
+===== core/kernel/invariants.py =====
+
+
+
