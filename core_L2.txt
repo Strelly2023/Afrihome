@@ -1,0 +1,3308 @@
+===== core/outbox/dispatcher.py =====
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional, Protocol
+from core.errors import ValidationError, OutboxDeliveryError
+from core.typing import TenantId, Millis, JSONObject, OutboxHeaders
+from core.time.clock import now_ms
+from core.outbox.model import OutboxRecord
+from core.outbox.backoff import Backoff, ExponentialBackoff
+from core.outbox.store_protocol import OutboxStore
+
+class Transport(Protocol):
+    def send(self, *, key: str, topic: str, payload: JSONObject, headers: Optional[OutboxHeaders] = None) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class Dispatcher:
+    store: OutboxStore
+    transport: Transport
+    backoff: Backoff = ExponentialBackoff()
+
+    def dispatch(self, *, tenant_id: Optional[TenantId] = None, limit: int = 100, now: Optional[int] = None) -> int:
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValidationError('limit must be a positive integer')
+        now_ms_value = int(now if now is not None else now_ms())
+        batch = self.store.fetch_ready(tenant_id=tenant_id, limit=limit, now_ms_value=Millis(now_ms_value))
+        if not batch:
+            return 0
+        sent = 0
+        for rec in batch:
+            try:
+                self.transport.send(key=rec.effective_key(), topic=rec.topic, payload=rec.payload, headers=rec.headers)
+                self.store.upsert(rec.mark_sent())
+                sent += 1
+            except Exception as exc:
+                err_msg = str(exc)[:512] if str(exc) else 'transport failure'
+                failed = rec.mark_failed(error_code=OutboxDeliveryError.code, error_message=err_msg, attempt_ts=now_ms_value)
+                retry = failed.schedule_retry(self.backoff, from_ts_ms=now_ms_value)
+                self.store.upsert(retry)
+                break
+        return sent
+
+    def dispatch_all(self, *, tenant_id: Optional[TenantId] = None, batch_size: int = 100, now: Optional[int] = None) -> int:
+        total = 0
+        while True:
+            n = self.dispatch(tenant_id=tenant_id, limit=batch_size, now=now)
+            if n <= 0:
+                return total
+            total += n
+
+
+
+===== core/outbox/topic_grammar.py =====
+from __future__ import annotations
+import re
+from typing import Final
+from core.errors import ValidationError
+
+TOPIC_RE: Final[re.Pattern[str]] = re.compile(r'^[a-z0-9._-]+$', re.ASCII)
+
+
+def normalize_topic(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError('topic must be a string')
+    return value.strip().lower()
+
+
+def is_valid_topic(value: str) -> bool:
+    try:
+        _ = validate_topic(value)
+        return True
+    except Exception:
+        return False
+
+
+def validate_topic(value: str) -> str:
+    v = normalize_topic(value)
+    if not v or not TOPIC_RE.match(v):
+        raise ValidationError('topic contains invalid characters', details={'topic': value})
+    return v
+
+
+
+===== core/outbox/memory_store.py =====
+from __future__ import annotations
+import threading
+from typing import Dict, Tuple, Optional, Sequence, List
+from core.errors import ValidationError
+from core.typing import TenantId, UUIDStr, Millis, JSONObject
+from core.outbox.model import OutboxRecord
+from core.outbox.store_protocol import OutboxStore
+
+class MemoryOutboxStore(OutboxStore):
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._records: Dict[Tuple[TenantId, UUIDStr], OutboxRecord] = {}
+
+    def save(self, record: OutboxRecord) -> None:
+        key = (record.tenant_id, record.id)
+        with self._lock:
+            if key in self._records:
+                return
+            self._records[key] = record
+
+    def upsert(self, record: OutboxRecord) -> None:
+        key = (record.tenant_id, record.id)
+        with self._lock:
+            self._records[key] = record
+
+    def fetch_ready(self, *, tenant_id: Optional[TenantId] = None, limit: int = 100, now_ms_value: Millis = Millis(0)) -> Sequence[OutboxRecord]:
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValidationError('limit must be a positive integer')
+        if not isinstance(now_ms_value, int) or now_ms_value <= 0:
+            raise ValidationError('now_ms_value must be positive integer')
+        with self._lock:
+            items: List[OutboxRecord] = [
+                rec for (t, _), rec in self._records.items()
+                if (tenant_id is None or t == tenant_id) and rec.ready(int(now_ms_value))
+            ]
+            def _due_at(r: OutboxRecord) -> int:
+                return int(r.next_retry_at if r.next_retry_at is not None else r.ts_ms)
+            items.sort(key=lambda r: (_due_at(r), int(r.ts_ms), r.id))
+            return items[:limit]
+
+    def snapshot(self) -> JSONObject:
+        with self._lock:
+            by_status: Dict[str, int] = {}
+            for rec in self._records.values():
+                by_status[rec.status] = by_status.get(rec.status, 0) + 1
+            return {'total': len(self._records), 'by_status': dict(sorted(by_status.items()))}
+
+
+
+===== core/outbox/__init__.py =====
+
+
+
+===== core/outbox/backoff.py =====
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Protocol
+from core.errors import ValidationError
+
+class Backoff(Protocol):
+    def delay_ms(self, retry_count: int) -> int: ...
+
+
+def _require_non_negative_int(name: str, value: int) -> None:
+    if not isinstance(value, int) or value < 0:
+        raise ValidationError(f'{name} must be a non-negative integer')
+
+
+def _require_positive_int(name: str, value: int) -> None:
+    if not isinstance(value, int) or value <= 0:
+        raise ValidationError(f'{name} must be a positive integer')
+
+
+@dataclass(frozen=True, slots=True)
+class FixedBackoff(Backoff):
+    delay: int = 1000
+    max_attempts: int = 10
+    def __post_init__(self) -> None:
+        _require_positive_int('delay', self.delay)
+        _require_positive_int('max_attempts', self.max_attempts)
+    def delay_ms(self, retry_count: int) -> int:
+        _require_non_negative_int('retry_count', retry_count)
+        return self.delay
+
+
+@dataclass(frozen=True, slots=True)
+class LinearBackoff(Backoff):
+    base_ms: int = 1000
+    step_ms: int = 1000
+    max_ms: int = 60_000
+    max_attempts: int = 10
+    def __post_init__(self) -> None:
+        _require_positive_int('base_ms', self.base_ms)
+        _require_positive_int('step_ms', self.step_ms)
+        _require_positive_int('max_ms', self.max_ms)
+        _require_positive_int('max_attempts', self.max_attempts)
+    def delay_ms(self, retry_count: int) -> int:
+        _require_non_negative_int('retry_count', retry_count)
+        delay = self.base_ms + self.step_ms * retry_count
+        return max(1, min(delay, self.max_ms))
+
+
+@dataclass(frozen=True, slots=True)
+class ExponentialBackoff(Backoff):
+    base_ms: int = 1000
+    factor: float = 2.0
+    max_ms: int = 60_000
+    max_attempts: int = 10
+    def __post_init__(self) -> None:
+        _require_positive_int('base_ms', self.base_ms)
+        if not isinstance(self.factor, (int, float)) or self.factor < 1.0:
+            raise ValidationError('factor must be a number >= 1.0')
+        _require_positive_int('max_ms', self.max_ms)
+        _require_positive_int('max_attempts', self.max_attempts)
+    def delay_ms(self, retry_count: int) -> int:
+        _require_non_negative_int('retry_count', retry_count)
+        delay = int(round(self.base_ms * (self.factor ** retry_count)))
+        return max(1, min(delay, self.max_ms))
+
+
+@dataclass(frozen=True, slots=True)
+class FibonacciBackoff(Backoff):
+    base_ms: int = 1000
+    max_ms: int = 60_000
+    max_attempts: int = 10
+    def __post_init__(self) -> None:
+        _require_positive_int('base_ms', self.base_ms)
+        _require_positive_int('max_ms', self.max_ms)
+        _require_positive_int('max_attempts', self.max_attempts)
+    def delay_ms(self, retry_count: int) -> int:
+        _require_non_negative_int('retry_count', retry_count)
+        if retry_count <= 1:
+            delay = self.base_ms
+        else:
+            a = b = self.base_ms
+            for _ in range(2, retry_count + 1):
+                a, b = b, a + b
+            delay = b
+        return max(1, min(delay, self.max_ms))
+
+
+
+===== core/outbox/model.py =====
+from __future__ import annotations
+from dataclasses import dataclass, field, replace
+from typing import Optional, Final, Mapping, Dict, Any, Literal
+from core.errors import ValidationError
+from core.typing import UUIDStr, Millis, TenantId, JSONObject, OutboxHeaders, OutboxRecordShape
+from core.time.clock import now_ms
+from core.outbox.backoff import Backoff
+from core.outbox.topic_grammar import validate_topic
+from core.events.headers import validate_headers
+
+Status = Literal['PENDING', 'SENT', 'FAILED', 'DLQ']
+_MAX_KEY_LEN: Final[int] = 256
+_MAX_ATTEMPTS: Final[int] = 1000
+
+
+def _require_non_empty_str(name: str, value: Optional[str], *, max_len: int) -> str:
+    if value is None:
+        raise ValidationError(f'{name} is required')
+    if not isinstance(value, str):
+        raise ValidationError(f'{name} must be a string')
+    v = value.strip()
+    if not v:
+        raise ValidationError(f'{name} must be non-empty')
+    if len(v) > max_len:
+        raise ValidationError(f'{name} too long', details={'max_len': max_len})
+    return v
+
+
+def _validate_headers(headers: Optional[OutboxHeaders]) -> None:
+    if headers is None:
+        return
+    validate_headers(headers)
+
+
+@dataclass(frozen=True, slots=True)
+class DLQRecord:
+    id: UUIDStr
+    tenant_id: TenantId
+    topic: str
+    payload: JSONObject
+    ts_ms: Millis
+    attempts: int
+    last_error_code: Optional[str] = None
+    last_error_message: Optional[str] = None
+    last_attempt_ms: Optional[Millis] = None
+    headers: Optional[OutboxHeaders] = None
+    key: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            'id': self.id,
+            'tenant_id': self.tenant_id,
+            'topic': self.topic,
+            'payload': dict(self.payload),
+            'ts_ms': int(self.ts_ms),
+            'attempts': int(self.attempts),
+            'last_error_code': self.last_error_code,
+            'last_error_message': self.last_error_message,
+            'last_attempt_ms': self.last_attempt_ms,
+        }
+        if self.headers is not None:
+            d['headers'] = dict(self.headers)
+        if self.key is not None:
+            d['key'] = self.key
+        return d
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxRecord:
+    id: UUIDStr
+    tenant_id: TenantId
+    topic: str
+    payload: JSONObject
+    ts_ms: Millis
+    headers: Optional[OutboxHeaders] = None
+    key: Optional[str] = None
+    retry_count: int = 0
+    next_retry_at: Optional[Millis] = None
+    max_attempts: int = 10
+    status: Status = 'PENDING'
+    last_error_code: Optional[str] = field(default=None, repr=False)
+    last_error_message: Optional[str] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str('id', self.id, max_len=_MAX_KEY_LEN)
+        _require_non_empty_str('tenant_id', self.tenant_id, max_len=64)
+        validate_topic(self.topic)
+        if not isinstance(self.payload, dict):
+            raise ValidationError('payload must be a JSON object (dict)')
+        if not isinstance(self.ts_ms, int) or self.ts_ms <= 0:
+            raise ValidationError('ts_ms must be positive integer')
+        _validate_headers(self.headers)
+        if self.key is not None:
+            _require_non_empty_str('key', self.key, max_len=_MAX_KEY_LEN)
+        if not isinstance(self.retry_count, int) or self.retry_count < 0:
+            raise ValidationError('retry_count must be non-negative integer')
+        if (not isinstance(self.max_attempts, int) or self.max_attempts <= 0 or self.max_attempts > _MAX_ATTEMPTS):
+            raise ValidationError('max_attempts out of range')
+        if self.next_retry_at is not None and (not isinstance(self.next_retry_at, int) or self.next_retry_at <= 0):
+            raise ValidationError('next_retry_at must be positive integer when provided')
+        if self.status not in ('PENDING', 'SENT', 'FAILED', 'DLQ'):
+            raise ValidationError('invalid status', details={'status': self.status})
+
+    def effective_key(self) -> str:
+        return self.key or self.id
+
+    def ready(self, now: int) -> bool:
+        if self.status != 'PENDING':
+            return False
+        return self.next_retry_at is None or now >= int(self.next_retry_at)
+
+    def mark_sent(self) -> 'OutboxRecord':
+        if self.status == 'SENT':
+            return self
+        return replace(self, status='SENT', next_retry_at=None, last_error_code=None, last_error_message=None)
+
+    def mark_failed(self, *, error_code: Optional[str], error_message: Optional[str], attempt_ts: Optional[int] = None) -> 'OutboxRecord':
+        code = (error_code or '')[:128] or None
+        msg = (error_message or '')[:512] or None
+        return replace(self, status='FAILED', last_error_code=code, last_error_message=msg)
+
+    def schedule_retry(self, policy: Backoff, *, from_ts_ms: Optional[int] = None) -> 'OutboxRecord':
+        if self.status == 'SENT':
+            return self
+        policy_max = getattr(policy, 'max_attempts', self.max_attempts)
+        if self.retry_count + 1 >= min(self.max_attempts, policy_max):
+            return replace(self, status='FAILED', next_retry_at=None, retry_count=self.retry_count + 1)
+        base = int(from_ts_ms if from_ts_ms is not None else now_ms())
+        try:
+            delay = int(getattr(policy, 'delay_ms')(self.retry_count))
+        except Exception:
+            try:
+                delay = int(getattr(policy, 'next_delay_ms')(self.retry_count))  # legacy
+            except Exception as _e:
+                raise ValidationError('invalid backoff policy')
+        if delay <= 0:
+            raise ValidationError('backoff policy returned a non-positive delay', details={'delay': delay})
+        next_at = base + delay
+        return replace(self, status='PENDING', retry_count=self.retry_count + 1, next_retry_at=next_at)
+
+    def to_dlq(self, *, now: Optional[int] = None) -> DLQRecord:
+        ts = int(now if now is not None else now_ms())
+        return DLQRecord(
+            id=self.id,
+            tenant_id=self.tenant_id,
+            topic=self.topic,
+            payload=dict(self.payload),
+            ts_ms=ts,
+            attempts=self.retry_count,
+            last_error_code=self.last_error_code,
+            last_error_message=self.last_error_message,
+            last_attempt_ms=self.next_retry_at,
+            headers=dict(self.headers) if self.headers is not None else None,
+            key=self.key,
+        )
+
+    def to_shape(self) -> OutboxRecordShape:
+        d: OutboxRecordShape = {
+            'id': self.id,
+            'tenant_id': self.tenant_id,
+            'topic': self.topic,
+            'payload': dict(self.payload),
+            'ts_ms': int(self.ts_ms),
+            'retry_count': int(self.retry_count),
+            'next_retry_at': self.next_retry_at,
+            'max_attempts': int(self.max_attempts),
+            'status': self.status,
+        }
+        if self.headers is not None:
+            d['headers'] = dict(self.headers)
+        if self.key is not None:
+            d['key'] = self.key
+        return d
+
+
+
+===== core/outbox/store_protocol.py =====
+from __future__ import annotations
+from typing import Protocol, Optional, Sequence
+from core.typing import TenantId, Millis, JSONObject
+from core.outbox.model import OutboxRecord
+
+class OutboxStore(Protocol):
+    def save(self, record: OutboxRecord) -> None: ...
+    def upsert(self, record: OutboxRecord) -> None: ...
+    def fetch_ready(self, *, tenant_id: Optional[TenantId] = None, limit: int = 100, now_ms_value: Millis = Millis(0)) -> Sequence[OutboxRecord]: ...
+    def snapshot(self) -> JSONObject: ...
+
+
+
+===== core/outbox/writer.py =====
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+from core.errors import ValidationError
+from core.typing import TenantId, UUIDStr, Millis, JSONObject, OutboxHeaders
+from core.identity.uuid import uuid7_str
+from core.events.envelope import Envelope
+from core.events.headers import validate_headers
+from core.outbox.model import OutboxRecord
+from core.outbox.topic_grammar import validate_topic
+
+@dataclass(frozen=True, slots=True)
+class OutboxWriter:
+    store: any
+    default_topic_prefix: Optional[str] = None
+
+    def _require_non_empty_str(self, name: str, value: Optional[str], *, max_len: int) -> str:
+        if value is None:
+            raise ValidationError(f'{name} is required')
+        if not isinstance(value, str):
+            raise ValidationError(f'{name} must be a string')
+        v = value.strip()
+        if not v:
+            raise ValidationError(f'{name} must be non-empty')
+        if len(v) > max_len:
+            raise ValidationError(f'{name} too long', details={'max_len': max_len})
+        return v
+
+    def _derive_topic(self, event_type: str, *, prefix: Optional[str] = None) -> str:
+        base = event_type.strip().lower()
+        topic = f"{prefix}.{base}" if (prefix and prefix.strip()) else base
+        return validate_topic(topic)
+
+    def to_record(
+        self,
+        *,
+        envelope: Envelope,
+        topic: Optional[str] = None,
+        headers: Optional[OutboxHeaders] = None,
+        key: Optional[str] = None,
+        ts_ms: Optional[Millis] = None,
+        record_id: Optional[UUIDStr] = None,
+        max_attempts: int = 10,
+    ) -> OutboxRecord:
+        tpc = topic or self._derive_topic(str(envelope.event.type), prefix=self.default_topic_prefix)
+        hdrs = headers if headers is not None else (envelope.headers or {})
+        validate_headers(hdrs)
+        k = (key or envelope.id).strip()
+        self._require_non_empty_str('key', k, max_len=256)
+        ts = int(envelope.ts_ms if ts_ms is None else ts_ms)
+        return OutboxRecord(
+            id=UUIDStr(record_id or uuid7_str()),
+            tenant_id=TenantId(envelope.tenant_id),
+            topic=tpc,
+            payload=envelope.to_dict(),
+            headers=hdrs,
+            key=k,
+            ts_ms=ts,
+            max_attempts=max_attempts,
+        )
+
+    def write(
+        self,
+        *,
+        envelope: Envelope,
+        topic: Optional[str] = None,
+        headers: Optional[OutboxHeaders] = None,
+        key: Optional[str] = None,
+        ts_ms: Optional[Millis] = None,
+        record_id: Optional[UUIDStr] = None,
+        max_attempts: int = 10,
+    ) -> OutboxRecord:
+        rec = self.to_record(
+            envelope=envelope,
+            topic=topic,
+            headers=headers,
+            key=key,
+            ts_ms=ts_ms,
+            record_id=record_id,
+            max_attempts=max_attempts,
+        )
+        self.store.save(rec)
+        return rec
+
+
+
+===== core/rbac/roles.py =====
+from __future__ import annotations
+from typing import Iterable
+from core.rbac.permissions import Role, PermissionGrant
+from core.rbac.grammar import validate_permission
+from core.errors import ValidationError
+
+
+def allow(permission: str) -> PermissionGrant:
+    return PermissionGrant(permission=validate_permission(permission), effect='allow')
+
+
+def deny(permission: str) -> PermissionGrant:
+    return PermissionGrant(permission=validate_permission(permission), effect='deny')
+
+
+def make_role(key: str, grants: Iterable[PermissionGrant]) -> Role:
+    k = (key or '').strip()
+    if not k:
+        raise ValidationError('role key must be non-empty')
+    return Role(k, tuple(grants))
+
+# Example built-ins (optional)
+OBSERVER = make_role('observer', (allow('core.health:read'),))
+SUPER_ADMIN = make_role('super_admin', (allow('core.*:*'),))
+
+__all__ = ['Role', 'PermissionGrant', 'allow', 'deny', 'make_role', 'OBSERVER', 'SUPER_ADMIN']
+
+
+
+===== core/rbac/__init__.py =====
+
+
+
+===== core/rbac/grammar.py =====
+from __future__ import annotations
+import re
+from typing import Final, Tuple
+from core.errors import ValidationError
+
+# Permission shape:
+# "<resource segments '.' separated>:<action segments '.' separated>"
+# - resource: starts with [a-z], then [a-z0-9_.-]* (segments separated by '.')
+# - action: starts with [a-z*], then [a-z0-9_.-]* (segments separated by '.')
+# - ASCII only, no spaces
+PERM_RE: Final[re.Pattern[str]] = re.compile(
+    r'^[a-z][a-z0-9_.-]*(\.[a-z0-9_.-]+)*:[a-z*][a-z0-9_.-]*(\.[a-z0-9_.-]+)*$',
+    re.ASCII,
+)
+
+
+def is_valid_permission(value: str) -> bool:
+    try:
+        _ = validate_permission(value)
+        return True
+    except Exception:
+        return False
+
+
+def validate_permission(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError('permission must be a string')
+    v = value.strip()
+    if not PERM_RE.match(v):
+        raise ValidationError('invalid permission format', details={'permission': value})
+    return v
+
+
+def split_permission(value: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    v = validate_permission(value)
+    res, act = v.split(':', 1)
+    return tuple(res.split('.')), tuple(act.split('.'))
+
+
+
+===== core/rbac/permissions.py =====
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from core.errors import ValidationError
+from core.typing import Permission as PermType, ActorId, TenantId
+from core.rbac.grammar import validate_permission
+
+@dataclass(frozen=True, slots=True)
+class PermissionGrant:
+    permission: PermType
+    effect: str = 'allow'  # 'allow' | 'deny'
+    def __post_init__(self) -> None:
+        p = PermType(validate_permission(str(self.permission)))
+        eff = (self.effect or '').strip().lower()
+        if eff not in ('allow', 'deny'):
+            raise ValidationError("effect must be 'allow' or 'deny'")
+        object.__setattr__(self, 'permission', p)
+        object.__setattr__(self, 'effect', eff)
+
+
+@dataclass(frozen=True, slots=True)
+class Role:
+    key: str
+    grants: tuple[PermissionGrant, ...] = field(default_factory=tuple)
+    def __post_init__(self) -> None:
+        k = (self.key or '').strip()
+        if not k:
+            raise ValidationError('role key must be non-empty')
+        object.__setattr__(self, 'key', k)
+        object.__setattr__(self, 'grants', tuple(self.grants))
+
+
+@dataclass(frozen=True, slots=True)
+class DirectGrants:
+    allows: tuple[PermType, ...] = field(default_factory=tuple)
+    denies: tuple[PermType, ...] = field(default_factory=tuple)
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'allows', tuple(PermType(validate_permission(str(p))) for p in self.allows))
+        object.__setattr__(self, 'denies', tuple(PermType(validate_permission(str(p))) for p in self.denies))
+
+
+@dataclass(frozen=True, slots=True)
+class Assignment:
+    actor_id: ActorId
+    tenant_id: Optional[TenantId] = None
+    roles: tuple[str, ...] = field(default_factory=tuple)
+    grants: DirectGrants = field(default_factory=DirectGrants)
+    def __post_init__(self) -> None:
+        a = (self.actor_id or '').strip()
+        if not a:
+            raise ValidationError('actor_id must be non-empty')
+        object.__setattr__(self, 'actor_id', ActorId(a))
+        object.__setattr__(self, 'roles', tuple(self.roles))
+
+
+class RBACStore:
+    def __init__(self) -> None:
+        self._roles: Dict[str, Role] = {}
+        self._assign: Dict[tuple[str, Optional[str]], Assignment] = {}
+    # Roles
+    def upsert_role(self, role: Role) -> None:
+        self._roles[role.key] = role
+    def get_role(self, key: str) -> Optional[Role]:
+        return self._roles.get(key)
+    def list_roles(self) -> Sequence[Role]:
+        return tuple(self._roles[k] for k in sorted(self._roles.keys()))
+    # Assignments
+    def upsert_assignment(self, assignment: Assignment) -> None:
+        self._assign[(str(assignment.actor_id), str(assignment.tenant_id) if assignment.tenant_id else None)] = assignment
+    def get_assignments(self, *, actor_id: ActorId, tenant_id: Optional[TenantId]) -> Sequence[Assignment]:
+        out: List[Assignment] = []
+        g = self._assign.get((str(actor_id), None))
+        if g:
+            out.append(g)
+        if tenant_id is not None:
+            t = self._assign.get((str(actor_id), str(tenant_id)))
+            if t:
+                out.append(t)
+        return tuple(out)
+
+
+def _seg_match(grant: tuple[str, ...], need: tuple[str, ...]) -> bool:
+    gi = 0
+    ni = 0
+    while gi < len(grant):
+        g = grant[gi]
+        if g == '*':
+            return True
+        if ni >= len(need):
+            return False
+        if g != need[ni]:
+            return False
+        gi += 1
+        ni += 1
+    return ni == len(need)
+
+
+def _split_perm(p: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    v = validate_permission(p)
+    resource, action = v.split(':', 1)
+    return tuple(resource.split('.')), tuple(action.split('.'))
+
+
+def _perm_match(grant_perm: str, need_perm: str) -> bool:
+    gr, ga = _split_perm(grant_perm)
+    nr, na = _split_perm(need_perm)
+    return _seg_match(gr, nr) and _seg_match(ga, na)
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionResolver:
+    store: RBACStore
+    def has(self, *, actor_id: ActorId, permission: PermType, tenant_id: Optional[TenantId] = None) -> bool:
+        need = PermType(validate_permission(str(permission)))
+        assigns = self.store.get_assignments(actor_id=actor_id, tenant_id=tenant_id)
+        denies: list[PermType] = []
+        allows: list[PermType] = []
+        for a in assigns:
+            denies.extend(a.grants.denies)
+            allows.extend(a.grants.allows)
+            for rk in a.roles:
+                r = self.store.get_role(rk)
+                if not r:
+                    continue
+                for g in r.grants:
+                    if g.effect == 'deny':
+                        denies.append(g.permission)
+                    else:
+                        allows.append(g.permission)
+        if any(_perm_match(str(d), str(need)) for d in denies):
+            return False
+        if any(_perm_match(str(a), str(need)) for a in allows):
+            return True
+        return False
+
+
+
+===== core/context/accessors.py =====
+"""
+GA Enterprise Core — Context Accessors
+--------------------------------------
+
+LAYER: L1
+Dependencies:
+- core.context.request_context
+- core.errors
+
+Purpose:
+- Enforce safe metadata access
+- Prevent silent None usage
+"""
+
+from __future__ import annotations
+
+from core.context.request_context import RequestContext
+from core.typing import (
+    TenantId,
+    UserId,
+    RequestId,
+    CorrelationId,
+)
+from core.errors import InvariantViolationError
+
+
+# ---------------------------------------------------------
+# Required Accessors
+# ---------------------------------------------------------
+
+def require_tenant_id(ctx: RequestContext) -> TenantId:
+    if ctx.tenant_id is None:
+        raise InvariantViolationError("Tenant ID is required")
+    return ctx.tenant_id
+
+
+def require_user_id(ctx: RequestContext) -> UserId:
+    if ctx.user_id is None:
+        raise InvariantViolationError("User ID is required")
+    return ctx.user_id
+
+
+def require_request_id(ctx: RequestContext) -> RequestId:
+    return ctx.request_id
+
+
+def require_correlation_id(ctx: RequestContext) -> CorrelationId:
+    return ctx.correlation_id
+
+
+===== core/context/request_context.py =====
+"""
+GA Enterprise Core — Immutable Request Context
+----------------------------------------------
+
+LAYER: L1
+Dependencies:
+- core.typing
+- core.kernel.invariants
+- core.errors
+
+Rules:
+- Fully immutable
+- No global state
+- No implicit defaults
+- All values injected
+- No time reads
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+from core.typing import (
+    TenantId,
+    UserId,
+    RequestId,
+    CorrelationId,
+    CausationId,
+    UnixMillis,
+)
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError
+
+
+@dataclass(frozen=True, slots=True)
+class RequestContext:
+    """
+    Immutable request metadata snapshot.
+
+    This object represents a single execution boundary.
+    """
+
+    request_id: RequestId
+    correlation_id: CorrelationId
+    causation_id: CausationId
+    timestamp_ms: UnixMillis
+
+    tenant_id: Optional[TenantId] = None
+    user_id: Optional[UserId] = None
+
+    # -----------------------------------------------------
+    # Validation
+    # -----------------------------------------------------
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.request_id, "request_id")
+        assert_not_none(self.correlation_id, "correlation_id")
+        assert_not_none(self.causation_id, "causation_id")
+        assert_not_none(self.timestamp_ms, "timestamp_ms")
+
+        if self.timestamp_ms < 0:
+            raise InvariantViolationError("timestamp_ms cannot be negative")
+
+    # -----------------------------------------------------
+    # Derived helpers (pure)
+    # -----------------------------------------------------
+
+    def is_authenticated(self) -> bool:
+        return self.user_id is not None
+
+    def is_multi_tenant(self) -> bool:
+        return self.tenant_id is not None
+
+    # -----------------------------------------------------
+    # Deterministic representation
+    # -----------------------------------------------------
+
+    def to_dict(self) -> dict[str, str | int | None]:
+        """
+        Deterministic serialization.
+        No dynamic fields.
+        """
+        return {
+            "request_id": str(self.request_id),
+            "correlation_id": str(self.correlation_id),
+            "causation_id": str(self.causation_id),
+            "timestamp_ms": int(self.timestamp_ms),
+            "tenant_id": str(self.tenant_id) if self.tenant_id else None,
+            "user_id": str(self.user_id) if self.user_id else None,
+        }
+
+
+===== core/context/__init__.py =====
+"""
+GA Enterprise Core — Request Context Layer
+
+LAYER: L1
+
+Purpose:
+- Immutable request metadata
+- Safe access helpers
+"""
+
+from .request_context import RequestContext
+from .accessors import (
+    require_tenant_id,
+    require_user_id,
+    require_request_id,
+    require_correlation_id,
+)
+
+
+===== core/identity/__init__.py =====
+
+
+
+===== core/identity/uuid.py =====
+"""
+GA Enterprise Core — Deterministic UUID Authority
+-------------------------------------------------
+
+LAYER: L0
+Dependencies: stdlib + core.errors + core.typing
+Randomness: FORBIDDEN
+Time access: FORBIDDEN
+Global state: NONE
+
+Rules:
+- Models must NEVER generate UUIDs.
+- UUIDs must be injected.
+- Default implementation must be deterministic.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import uuid
+from typing import Protocol, runtime_checkable, Final
+
+from core.errors import InvariantViolationError
+from core.typing import (
+    EventId,
+    AggregateId,
+    CorrelationId,
+    CausationId,
+)
+
+
+# ============================================================
+# UUID Provider Protocol
+# ============================================================
+
+@runtime_checkable
+class UUIDProvider(Protocol):
+    """
+    Deterministic UUID provider contract.
+
+    Implementations must be:
+    - Pure
+    - Deterministic
+    - Side-effect free
+    """
+
+    def new_event_id(self) -> EventId: ...
+    def new_aggregate_id(self) -> AggregateId: ...
+    def new_correlation_id(self) -> CorrelationId: ...
+    def new_causation_id(self) -> CausationId: ...
+
+
+# ============================================================
+# Deterministic Namespace Provider
+# ============================================================
+
+class DeterministicUUIDProvider:
+    """
+    Deterministic UUIDv5-based provider.
+
+    Requires explicit seed.
+    No randomness.
+    No global counters.
+    """
+
+    _NAMESPACE: Final[uuid.UUID] = uuid.UUID(
+        "12345678-1234-5678-1234-567812345678"
+    )
+
+    def __init__(self, seed: str) -> None:
+        if not seed:
+            raise InvariantViolationError("UUID seed must be non-empty")
+        self._seed = seed
+
+    # -------------------------
+    # Internal helper
+    # -------------------------
+
+    def _derive(self, name: str) -> str:
+        """
+        Derives deterministic UUID from seed + name.
+        """
+        full = f"{self._seed}:{name}"
+        digest = hashlib.sha256(full.encode("utf-8")).hexdigest()
+        return str(uuid.uuid5(self._NAMESPACE, digest))
+
+    # -------------------------
+    # Public API
+    # -------------------------
+
+    def new_event_id(self) -> EventId:
+        return EventId(self._derive("event"))
+
+    def new_aggregate_id(self) -> AggregateId:
+        return AggregateId(self._derive("aggregate"))
+
+    def new_correlation_id(self) -> CorrelationId:
+        return CorrelationId(self._derive("correlation"))
+
+    def new_causation_id(self) -> CausationId:
+        return CausationId(self._derive("causation"))
+
+
+===== core/tenancy/tenant_context.py =====
+from __future__ import annotations
+from dataclasses import replace
+from typing import Mapping, Optional
+from core.errors import ValidationError, TenantIsolationError
+from core.typing import TenantId, JSONObject
+from core.context.request_context import current_context, try_current_context
+from core.tenancy.grammar import validate_slug
+
+
+def current_tenant() -> TenantId:
+    return current_context().tenant_id
+
+
+def try_current_tenant() -> Optional[TenantId]:
+    ctx = try_current_context()
+    return ctx.tenant_id if ctx else None
+
+
+def tenant_from_headers(headers: Mapping[str, str]) -> TenantId:
+    if not isinstance(headers, Mapping):
+        raise ValidationError('headers must be a mapping')
+    norm = {str(k).strip().lower(): str(v).strip() for k, v in headers.items()}
+    raw = norm.get('x-tenant') or norm.get('x_tenant') or norm.get('tenant')
+    if not raw:
+        raise ValidationError('Missing X-Tenant header')
+    return TenantId(validate_slug(raw))
+
+
+def assert_tenant(expected: str | TenantId) -> None:
+    exp = TenantId(validate_slug(str(expected)))
+    cur = current_tenant()
+    if cur != exp:
+        raise TenantIsolationError('Tenant isolation breach', details={'expected': str(exp), 'current': str(cur)})
+
+
+def require_tenant(header_tenant: str | TenantId) -> TenantId:
+    hdr = TenantId(validate_slug(str(header_tenant)))
+    cur = current_tenant()
+    if cur != hdr:
+        raise TenantIsolationError('Tenant mismatch', details={'header': str(hdr), 'context': str(cur)})
+    return hdr
+
+
+def tenant_snapshot() -> JSONObject:
+    ctx = try_current_context()
+    if not ctx:
+        return {}
+    return {'tenant_id': str(ctx.tenant_id), 'mode': str(ctx.mode), 'trace_id': str(ctx.trace_id), 'hlc': ctx.hlc.to_dict()}
+
+
+
+===== core/tenancy/tenant.py =====
+from __future__ import annotations
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Mapping, Any, Optional, Final
+from core.errors import ValidationError
+from core.typing import TenantId, UUIDStr, Millis, JSONObject
+from core.time.clock import now_ms
+from core.identity.uuid import uuid7_str
+from core.tenancy.grammar import validate_slug
+
+_ALLOWED_STATES: Final[tuple[str, ...]] = ('active', 'suspended', 'deleted')
+
+
+def _non_empty_str(name: str, value: str, *, max_len: int) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f'{name} must be a string')
+    v = value.strip()
+    if not v:
+        raise ValidationError(f'{name} must be non-empty')
+    if len(v) > max_len:
+        raise ValidationError(f'{name} too long', details={'max': max_len, 'len': len(v)})
+    return v
+
+
+def _frozen_map(m: Optional[Mapping[str, Any]]) -> Mapping[str, Any]:
+    if m is None:
+        return MappingProxyType({})
+    return MappingProxyType(dict(m))
+
+
+@dataclass(frozen=True, slots=True)
+class Tenant:
+    id: UUIDStr
+    slug: TenantId
+    name: str
+    status: str
+    created_ms: Millis
+    updated_ms: Millis
+    version: int = 0
+    meta: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    features: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    limits: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        slug: str,
+        name: str,
+        status: str = 'active',
+        meta: Optional[Mapping[str, Any]] = None,
+        features: Optional[Mapping[str, Any]] = None,
+        limits: Optional[Mapping[str, Any]] = None,
+        ts_ms: Optional[int] = None,
+        id: Optional[str] = None,
+    ) -> 'Tenant':
+        s = TenantId(validate_slug(slug))
+        nm = _non_empty_str('name', name, max_len=200)
+        st = status.strip().lower()
+        if st not in _ALLOWED_STATES:
+            raise ValidationError('invalid status', details={'status': status, 'allowed': list(_ALLOWED_STATES)})
+        t = Millis(int(ts_ms if ts_ms is not None else now_ms()))
+        return cls(
+            id=UUIDStr(id or uuid7_str()),
+            slug=s,
+            name=nm,
+            status=st,
+            created_ms=t,
+            updated_ms=t,
+            version=0,
+            meta=_frozen_map(meta),
+            features=_frozen_map(features),
+            limits=_frozen_map(limits),
+        )
+
+    def with_update(
+        self,
+        *,
+        name: Optional[str] = None,
+        status: Optional[str] = None,
+        meta: Optional[Mapping[str, Any]] = None,
+        features: Optional[Mapping[str, Any]] = None,
+        limits: Optional[Mapping[str, Any]] = None,
+        ts_ms: Optional[int] = None,
+    ) -> 'Tenant':
+        nm = self.name if name is None else _non_empty_str('name', name, max_len=200)
+        st = self.status if status is None else status.strip().lower()
+        if st not in _ALLOWED_STATES:
+            raise ValidationError('invalid status', details={'status': st, 'allowed': list(_ALLOWED_STATES)})
+        upd = Millis(int(ts_ms if ts_ms is not None else now_ms()))
+        return Tenant(
+            id=self.id,
+            slug=self.slug,
+            name=nm,
+            status=st,
+            created_ms=self.created_ms,
+            updated_ms=upd,
+            version=self.version + 1,
+            meta=_frozen_map(meta) if meta is not None else self.meta,
+            features=_frozen_map(features) if features is not None else self.features,
+            limits=_frozen_map(limits) if limits is not None else self.limits,
+        )
+
+    def to_dict(self) -> JSONObject:
+        return {
+            'id': str(self.id),
+            'slug': str(self.slug),
+            'name': str(self.name),
+            'status': str(self.status),
+            'created_ms': int(self.created_ms),
+            'updated_ms': int(self.updated_ms),
+            'version': int(self.version),
+            'meta': dict(self.meta),
+            'features': dict(self.features),
+            'limits': dict(self.limits),
+        }
+
+
+
+===== core/tenancy/__init__.py =====
+
+
+
+===== core/tenancy/grammar.py =====
+from __future__ import annotations
+import re
+from typing import Final
+from core.errors import ValidationError
+
+# Tenant slug rules (ASCII, lowercase only):
+# - 1..64 chars
+# - allowed: a–z, 0–9, dot (.), hyphen (-)
+# - must not start/end with '.' or '-'
+SLUG_RE: Final[re.Pattern[str]] = re.compile(r'^(?![.-])[a-z0-9][a-z0-9.-]{1,62}[a-z0-9]$', re.ASCII)
+
+
+def normalize_slug(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError('tenant slug must be a string')
+    return value.strip().lower()
+
+
+def is_valid_slug(value: str) -> bool:
+    try:
+        _ = validate_slug(value)
+        return True
+    except Exception:
+        return False
+
+
+def validate_slug(value: str) -> str:
+    v = normalize_slug(value)
+    if not SLUG_RE.match(v):
+        raise ValidationError('invalid tenant slug', details={'slug': value})
+    return v
+
+
+
+===== core/tenancy/resolver.py =====
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Mapping, Optional, Protocol, Tuple, Dict
+from core.typing import TenantId, JSONObject
+from core.errors import ValidationError, TenantIsolationError, NotFoundError
+from core.tenancy.grammar import validate_slug
+from core.context.request_context import try_current_context
+
+@dataclass(frozen=True)
+class ResolveResult:
+    tenant_id: Optional[TenantId]
+    source: Optional[str]
+    confidence: float = 0.0
+    reason: Optional[str] = None
+    details: Optional[JSONObject] = None
+    def to_dict(self) -> JSONObject:
+        return {
+            'tenant_id': self.tenant_id,
+            'source': self.source,
+            'confidence': float(self.confidence),
+            'reason': self.reason,
+            'details': dict(self.details) if isinstance(self.details, dict) else self.details,
+        }
+
+class TenantResolver(Protocol):
+    def resolve(self) -> ResolveResult: ...
+
+
+@dataclass(frozen=True)
+class HeaderTenantResolver:
+    headers: Mapping[str, Any]
+    def resolve(self) -> ResolveResult:
+        if not isinstance(self.headers, Mapping):
+            return ResolveResult(None, 'header', 0.0, 'not_mapping')
+        norm = {str(k).strip().lower(): str(v).strip() for k, v in self.headers.items()}
+        raw = norm.get('x-tenant') or norm.get('x_tenant') or norm.get('tenant')
+        if not raw:
+            return ResolveResult(None, 'header', 0.0, 'missing')
+        try:
+            tid = TenantId(validate_slug(raw))
+            return ResolveResult(tid, 'header:x-tenant', 1.0)
+        except ValidationError as exc:
+            return ResolveResult(None, 'header:x-tenant', 0.0, 'invalid_header', {'error': str(exc)})
+
+
+@dataclass(frozen=True)
+class PathTenantResolver:
+    path_params: Mapping[str, Any]
+    keys: Tuple[str, ...] = ('tenant', 'org')
+    def resolve(self) -> ResolveResult:
+        if not isinstance(self.path_params, Mapping):
+            return ResolveResult(None, 'path', 0.0, 'not_mapping')
+        for k in self.keys:
+            raw = self.path_params.get(k)
+            if raw:
+                try:
+                    tid = TenantId(validate_slug(str(raw)))
+                    return ResolveResult(tid, f'path:{k}', 0.8)
+                except ValidationError as exc:
+                    return ResolveResult(None, f'path:{k}', 0.0, 'invalid_path', {'error': str(exc)})
+        return ResolveResult(None, 'path', 0.0, 'missing')
+
+
+@dataclass(frozen=True)
+class QueryTenantResolver:
+    query_params: Mapping[str, Any]
+    keys: Tuple[str, ...] = ('tenant', 'org')
+    def resolve(self) -> ResolveResult:
+        if not isinstance(self.query_params, Mapping):
+            return ResolveResult(None, 'query', 0.0, 'not_mapping')
+        def first(v: Any) -> Optional[str]:
+            if v is None:
+                return None
+            if isinstance(v, (list, tuple)) and v:
+                return str(v[0]).strip()
+            return str(v).strip()
+        for k in self.keys:
+            raw = first(self.query_params.get(k))
+            if raw:
+                try:
+                    tid = TenantId(validate_slug(raw))
+                    return ResolveResult(tid, f'query:{k}', 0.7)
+                except ValidationError as exc:
+                    return ResolveResult(None, f'query:{k}', 0.0, 'invalid_query', {'error': str(exc)})
+        return ResolveResult(None, 'query', 0.0, 'missing')
+
+
+@dataclass(frozen=True)
+class ContextTenantResolver:
+    def resolve(self) -> ResolveResult:
+        c = try_current_context()
+        if not c:
+            return ResolveResult(None, 'context', 0.0, 'no_context')
+        try:
+            tid = TenantId(validate_slug(str(c.tenant_id)))
+            return ResolveResult(tid, 'context', 0.6)
+        except ValidationError as exc:
+            return ResolveResult(None, 'context', 0.0, 'invalid_context', {'error': str(exc)})
+
+
+@dataclass(frozen=True)
+class CompositeTenantResolver:
+    resolvers: Tuple[TenantResolver, ...]
+    strict: bool = True
+    def resolve(self) -> ResolveResult:
+        chosen: Optional[TenantId] = None
+        first: Optional[str] = None
+        evidence: Dict[str, Any] = {}
+        for r in self.resolvers:
+            res = r.resolve()
+            evidence[res.source or f'r{len(evidence)+1}'] = res.to_dict()
+            if res.tenant_id:
+                if chosen is None:
+                    chosen, first = res.tenant_id, res.source
+                elif res.tenant_id != chosen:
+                    raise TenantIsolationError('Conflicting tenants', details={
+                        'chosen': str(chosen), 'new': str(res.tenant_id), 'first_source': first, 'conflicting_source': res.source, 'evidence': evidence
+                    })
+        if chosen is None:
+            if self.strict:
+                raise NotFoundError('Tenant not resolved', details={'evidence': evidence})
+            return ResolveResult(None, None, 0.0, 'unresolved', evidence)
+        return ResolveResult(chosen, first, 1.0, details=evidence)
+
+
+
+===== core/health/registry.py =====
+from __future__ import annotations
+import time
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Literal
+from core.errors import ValidationError
+from core.time.clock import now_ms
+
+HealthStatus = Literal['OK', 'WARN', 'ERROR']
+HealthLevel = Literal['liveness', 'readiness', 'startup', 'diagnostics']
+
+@dataclass(frozen=True, slots=True)
+class HealthCheckResult:
+    name: str
+    level: HealthLevel
+    status: HealthStatus
+    details: Mapping[str, Any]
+    ts_ms: int
+    duration_ms: int
+    critical: bool
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'name': self.name,
+            'level': self.level,
+            'status': self.status,
+            'critical': self.critical,
+            'ts_ms': int(self.ts_ms),
+            'duration_ms': int(self.duration_ms),
+            'details': dict(self.details or {}),
+        }
+
+@dataclass(frozen=True, slots=True)
+class _Entry:
+    name: str
+    level: HealthLevel
+    critical: bool
+    ttl_ms: int
+    fn: Callable[[], Any]
+    cached_at: Optional[int] = None
+    cached: Optional[HealthCheckResult] = None
+
+class HealthRegistry:
+    def __init__(self) -> None:
+        self._items: Dict[str, _Entry] = {}
+
+    def register(self, name: str, fn: Callable[[], Any], *, level: HealthLevel = 'readiness', critical: bool = True, ttl_ms: int = 2000) -> None:
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError('health check name must be non-empty string')
+        if name in self._items:
+            raise ValidationError(f'duplicate health check: {name}')
+        if level not in ('liveness', 'readiness', 'startup', 'diagnostics'):
+            raise ValidationError('invalid health level')
+        if not isinstance(ttl_ms, int) or ttl_ms <= 0:
+            raise ValidationError('ttl_ms must be positive integer')
+        self._items[name] = _Entry(name, level, bool(critical), int(ttl_ms), fn)
+
+    def unregister(self, name: str) -> bool:
+        return self._items.pop(name, None) is not None
+
+    def clear(self) -> None:
+        self._items.clear()
+
+    def run(self, *, level: Optional[HealthLevel] = None, names: Optional[Tuple[str, ...]] = None, fresh: bool = False) -> Dict[str, Any]:
+        selected: Dict[str, _Entry] = {}
+        if names:
+            for n in names:
+                ent = self._items.get(n)
+                if not ent:
+                    raise ValidationError(f'unknown health check: {n}')
+                if level and ent.level != level:
+                    continue
+                selected[n] = ent
+        else:
+            for n, ent in self._items.items():
+                if level and ent.level != level:
+                    continue
+                selected[n] = ent
+        now = int(now_ms())
+        results: Dict[str, HealthCheckResult] = {}
+        for n in sorted(selected.keys()):
+            ent = selected[n]
+            if (not fresh) and ent.cached and ent.cached_at and (now - ent.cached_at) < ent.ttl_ms:
+                results[n] = ent.cached
+                continue
+            t0 = time.perf_counter()
+            try:
+                raw = ent.fn()
+                if isinstance(raw, HealthCheckResult):
+                    res = raw
+                elif isinstance(raw, tuple) and len(raw) == 2:
+                    status_raw, details = raw
+                    status = str(status_raw).upper()
+                    status = status if status in ('OK', 'WARN', 'ERROR') else 'OK'
+                    res = HealthCheckResult(ent.name, ent.level, status, dict(details or {}), now, int((time.perf_counter() - t0) * 1000), ent.critical)
+                elif isinstance(raw, dict):
+                    res = HealthCheckResult(ent.name, ent.level, 'OK', raw, now, int((time.perf_counter() - t0) * 1000), ent.critical)
+                else:
+                    res = HealthCheckResult(ent.name, ent.level, 'OK', {'value': str(raw)}, now, int((time.perf_counter() - t0) * 1000), ent.critical)
+            except Exception as exc:
+                res = HealthCheckResult(ent.name, ent.level, 'ERROR', {'error': type(exc).__name__, 'message': str(exc)[:512]}, now, int((time.perf_counter() - t0) * 1000), ent.critical)
+            ent = replace(ent, cached=res, cached_at=now)
+            self._items[n] = ent
+            results[n] = res
+        overall = 'OK'
+        if any(r.critical and r.status == 'ERROR' for r in results.values()):
+            overall = 'ERROR'
+        elif any(r.critical and r.status == 'WARN' for r in results.values()):
+            overall = 'WARN'
+        return {'ts_ms': now, 'status': overall, 'checks': [results[k].to_dict() for k in sorted(results.keys())]}
+
+
+
+===== core/health/diagnostics.py =====
+from __future__ import annotations
+from core.health.registry import HealthRegistry, HealthCheckResult
+from core.time.clock import now_ms, clock_info
+from core.kernel.freeze import is_kernel_frozen
+from core.registry.services import resolved_snapshot
+
+reg = HealthRegistry()
+
+def check_liveness() -> HealthCheckResult:
+    return HealthCheckResult(
+        name='core.liveness', level='liveness', status='OK', details={'ts_ms': int(now_ms())}, ts_ms=int(now_ms()), duration_ms=0, critical=False
+    )
+
+
+def check_kernel():
+    frozen = bool(is_kernel_frozen())
+    status = 'OK' if frozen else 'WARN'
+    return (status, {'kernel_frozen': frozen, 'clock': clock_info(), 'services_resolved': resolved_snapshot()})
+
+reg.register('core.liveness', check_liveness, level='liveness', critical=False, ttl_ms=1000)
+reg.register('core.kernel', check_kernel, level='readiness', critical=True, ttl_ms=3000)
+
+
+
+===== core/health/__init__.py =====
+
+
+
+===== core/__init__.py =====
+
+
+
+===== core/saga/__init__.py =====
+
+
+
+===== core/saga/manager.py =====
+from __future__ import annotations
+from typing import Optional, Protocol
+from core.errors import ValidationError, ConflictError
+from core.saga.state import SagaState
+from core.events.event import Event
+
+class SagaStorage(Protocol):
+    def load(self, saga_id: str) -> Optional[SagaState]: ...
+    def save(self, state: SagaState) -> None: ...
+    def try_save(self, state: SagaState, expected_version: int) -> bool: ...
+
+class SagaDefinition(Protocol):
+    saga_type: str
+    def initial_state(self, *, saga_id: str, tenant_id: str, event: Event) -> SagaState: ...
+    def handle(self, state: SagaState, event: Event) -> SagaState: ...
+
+class SagaManager:
+    def __init__(self, storage: SagaStorage) -> None:
+        self._storage = storage
+        self._defs: dict[str, SagaDefinition] = {}
+
+    def register(self, definition: SagaDefinition) -> None:
+        if not getattr(definition, 'saga_type', None):
+            raise ValidationError("Invalid saga definition (missing 'saga_type')")
+        self._defs[definition.saga_type] = definition
+
+    def handle_event(self, *, saga_id: str, saga_type: str, tenant_id: str, event: Event, use_optimistic_concurrency: bool = True) -> SagaState:
+        if not saga_id.strip():
+            raise ValidationError('saga_id must be non-empty')
+        if not saga_type.strip():
+            raise ValidationError('saga_type must be non-empty')
+        if not tenant_id.strip():
+            raise ValidationError('tenant_id must be non-empty')
+        d = self._defs.get(saga_type)
+        if not d:
+            raise ValidationError(f'Saga type not registered: {saga_type}')
+        current = self._storage.load(saga_id)
+        if current is None:
+            current = d.initial_state(saga_id=saga_id, tenant_id=tenant_id, event=event)
+            self._storage.save(current)
+        new_state = d.handle(current, event)
+        if new_state.version <= current.version:
+            new_state = SagaState(
+                saga_id=new_state.saga_id,
+                saga_type=new_state.saga_type,
+                tenant_id=new_state.tenant_id,
+                status=new_state.status,
+                data=new_state.data,
+                version=current.version + 1,
+                processed_event_ids=new_state.processed_event_ids,
+            )
+        if use_optimistic_concurrency and hasattr(self._storage, 'try_save'):
+            ok = self._storage.try_save(new_state, expected_version=current.version)
+            if not ok:
+                raise ConflictError('Saga concurrent modification', details={'saga_id': saga_id, 'expected': current.version})
+        else:
+            self._storage.save(new_state)
+        return new_state
+
+
+
+===== core/saga/state.py =====
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Mapping, Tuple
+
+@dataclass(frozen=True, slots=True)
+class SagaState:
+    saga_id: str
+    saga_type: str
+    tenant_id: str
+    status: str
+    data: Mapping[str, Any]
+    version: int = 0
+    processed_event_ids: Tuple[str, ...] = ()
+
+    def with_update(self, *, status: str | None = None, data: Mapping[str, Any] | None = None, append_event_id: str | None = None, keep_last_n_ids: int = 1024) -> 'SagaState':
+        new_status = status or self.status
+        merged = dict(self.data)
+        if data:
+            merged.update(data)
+        proc = list(self.processed_event_ids)
+        if append_event_id and append_event_id not in proc:
+            proc.append(append_event_id)
+        if keep_last_n_ids > 0 and len(proc) > keep_last_n_ids:
+            proc = proc[-keep_last_n_ids:]
+        return SagaState(
+            saga_id=self.saga_id,
+            saga_type=self.saga_type,
+            tenant_id=self.tenant_id,
+            status=new_status,
+            data=merged,
+            version=self.version + 1,
+            processed_event_ids=tuple(proc),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            'saga_id': self.saga_id,
+            'saga_type': self.saga_type,
+            'tenant_id': self.tenant_id,
+            'status': self.status,
+            'version': int(self.version),
+            'data': dict(self.data),
+            'processed_event_ids': list(self.processed_event_ids),
+        }
+
+
+
+===== core/time/clock.py =====
+"""
+GA Enterprise Core — Clock Authority
+-------------------------------------
+
+LAYER: L0
+Dependencies: stdlib + core.typing + core.errors
+System time access: FORBIDDEN inside models
+Deterministic: YES
+
+Rules:
+- Time must be injected.
+- No datetime.now() in models.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Protocol, runtime_checkable
+
+from core.typing import UnixMillis
+from core.errors import InvariantViolationError
+
+
+# ============================================================
+# Clock Protocol
+# ============================================================
+
+@runtime_checkable
+class Clock(Protocol):
+    """
+    Deterministic clock contract.
+    """
+
+    def now_ms(self) -> UnixMillis: ...
+
+
+# ============================================================
+# System Clock (Adapter-Safe Only)
+# ============================================================
+
+class SystemClock:
+    """
+    Real system clock.
+
+    NOTE:
+    - May only be instantiated at infrastructure boundary.
+    - Never inside models.
+    """
+
+    def now_ms(self) -> UnixMillis:
+        return UnixMillis(int(time.time() * 1000))
+
+
+# ============================================================
+# Fixed Clock (Deterministic Testing)
+# ============================================================
+
+class FixedClock:
+    """
+    Always returns the same timestamp.
+    Fully deterministic.
+    """
+
+    def __init__(self, fixed_time: UnixMillis) -> None:
+        if fixed_time < 0:
+            raise InvariantViolationError("Time cannot be negative")
+        self._fixed_time = fixed_time
+
+    def now_ms(self) -> UnixMillis:
+        return self._fixed_time
+
+
+===== core/time/__init__.py =====
+
+
+
+===== core/time/hlc.py =====
+"""
+GA Enterprise Core — Hybrid Logical Clock (HLC)
+-----------------------------------------------
+
+LAYER: L0
+Dependencies: core.typing + core.errors
+System time access: NONE
+Threading: NONE
+IO: NONE
+
+Purpose:
+- Provide causal ordering
+- Combine physical time + logical counter
+- Deterministic state transitions
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from core.typing import UnixMillis
+from core.errors import InvariantViolationError
+
+
+@dataclass(frozen=True, slots=True)
+class HLC:
+    """
+    Hybrid Logical Clock state.
+
+    physical: Unix milliseconds
+    logical: logical counter
+    """
+
+    physical: UnixMillis
+    logical: int
+
+    def __post_init__(self) -> None:
+        if self.physical < 0:
+            raise InvariantViolationError("Physical time cannot be negative")
+        if self.logical < 0:
+            raise InvariantViolationError("Logical counter cannot be negative")
+
+    # -----------------------------------------------------
+    # Local event
+    # -----------------------------------------------------
+
+    def tick(self, now: UnixMillis) -> "HLC":
+        """
+        Advances clock for a local event.
+        """
+        if now < 0:
+            raise InvariantViolationError("Time cannot be negative")
+
+        if now > self.physical:
+            return HLC(now, 0)
+
+        return HLC(self.physical, self.logical + 1)
+
+    # -----------------------------------------------------
+    # Merge remote clock
+    # -----------------------------------------------------
+
+    def merge(self, remote: "HLC", now: UnixMillis) -> "HLC":
+        """
+        Merges with remote clock.
+        """
+        if now < 0:
+            raise InvariantViolationError("Time cannot be negative")
+
+        max_physical = max(self.physical, remote.physical, now)
+
+        if max_physical == self.physical == remote.physical:
+            return HLC(max_physical, max(self.logical, remote.logical) + 1)
+
+        if max_physical == self.physical:
+            return HLC(max_physical, self.logical + 1)
+
+        if max_physical == remote.physical:
+            return HLC(max_physical, remote.logical + 1)
+
+        return HLC(max_physical, 0)
+
+
+===== core/typing/__init__.py =====
+"""
+GA Enterprise Core — Deterministic Typing Primitives
+----------------------------------------------------
+
+LAYER: L0
+Dependencies: stdlib only
+Infrastructure: NONE
+Deterministic: YES
+
+Rules:
+- No runtime mutation helpers
+- No reflection
+- No dynamic type factories
+- Protocol-first design
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import (
+    Any,
+    Final,
+    NewType,
+    Protocol,
+    TypeVar,
+    runtime_checkable,
+)
+
+
+# ============================================================
+# Strong Domain Types
+# ============================================================
+
+TenantId = NewType("TenantId", str)
+UserId = NewType("UserId", str)
+RequestId = NewType("RequestId", str)
+EventId = NewType("EventId", str)
+CorrelationId = NewType("CorrelationId", str)
+CausationId = NewType("CausationId", str)
+AggregateId = NewType("AggregateId", str)
+Permission = NewType("Permission", str)
+RoleName = NewType("RoleName", str)
+
+
+# ============================================================
+# Time & Version Types
+# ============================================================
+
+UnixMillis = NewType("UnixMillis", int)
+Version = NewType("Version", int)
+
+
+# ============================================================
+# Generic Type Variables
+# ============================================================
+
+T = TypeVar("T")
+K = TypeVar("K")
+V = TypeVar("V")
+R = TypeVar("R")
+
+
+# ============================================================
+# Protocol Foundations
+# ============================================================
+
+@runtime_checkable
+class Identifiable(Protocol):
+    """
+    Protocol for entities that expose an ID.
+    """
+
+    id: Any
+
+
+@runtime_checkable
+class Versioned(Protocol):
+    """
+    Protocol for version-controlled entities.
+    """
+
+    version: Version
+
+
+@runtime_checkable
+class Serializable(Protocol):
+    """
+    Deterministic serialization contract.
+    """
+
+    def to_dict(self) -> dict[str, Any]: ...
+
+
+# ============================================================
+# Frozen Model Base
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class FrozenModel:
+    """
+    Base class for deterministic immutable models.
+
+    Enforces:
+    - Immutability
+    - Slot usage
+    - Predictable memory layout
+    """
+
+    pass
+
+
+# ============================================================
+# Deterministic Constants
+# ============================================================
+
+TRUE: Final[bool] = True
+FALSE: Final[bool] = False
+
+
+===== core/audit/storage_protocol.py =====
+from __future__ import annotations
+from typing import Protocol, Optional, Sequence
+from core.audit.audit_record import AuditRecord
+
+class AuditStorage(Protocol):
+    def save(self, rec: AuditRecord) -> None: ...
+    def get(self, id: str) -> Optional[AuditRecord]: ...
+    def list(self, *, tenant_id: Optional[str] = None, limit: int = 100) -> Sequence[AuditRecord]: ...
+
+
+
+===== core/audit/merkle.py =====
+from __future__ import annotations
+import hashlib
+from dataclasses import dataclass
+from typing import Final, Sequence, Tuple
+from core.errors import ValidationError
+from core.audit.audit_record import AuditRecord
+
+_LEAF_TAG: Final[bytes] = b"\x00"
+_NODE_TAG: Final[bytes] = b"\x01"
+_HEX_LEN: Final[int] = 64
+
+
+def _sha256_hex(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def _is_hex_256(h: str) -> bool:
+    if not isinstance(h, str) or len(h) != _HEX_LEN:
+        return False
+    try:
+        int(h, 16)
+        return True
+    except Exception:
+        return False
+
+
+def merkle_leaf_from_record(record: AuditRecord) -> str:
+    if not record.hash or not _is_hex_256(record.hash):
+        raise ValidationError('AuditRecord.hash must be a 64-char hex string')
+    return _sha256_hex(_LEAF_TAG + bytes.fromhex(record.hash))
+
+
+def merkle_parent(left_hex: str, right_hex: str) -> str:
+    if not (_is_hex_256(left_hex) and _is_hex_256(right_hex)):
+        raise ValidationError('left/right must be 64-char hex strings')
+    return _sha256_hex(_NODE_TAG + bytes.fromhex(left_hex) + bytes.fromhex(right_hex))
+
+
+@dataclass(frozen=True, slots=True)
+class MerkleTree:
+    levels: Tuple[Tuple[str, ...], ...]
+    duplicate_last: bool = True
+    @property
+    def root(self) -> str:
+        return self.levels[-1][0] if self.levels and self.levels[-1] else ''
+    @staticmethod
+    def build(leaves: Sequence[str], *, duplicate_last: bool = True) -> 'MerkleTree':
+        if not leaves:
+            return MerkleTree(((),), duplicate_last)
+        for h in leaves:
+            if not _is_hex_256(h):
+                raise ValidationError('leaf must be 64-char hex string')
+        level = tuple(leaves)
+        levels = [level]
+        while len(level) > 1:
+            nxt = []
+            i = 0
+            L = len(level)
+            while i < L:
+                left = level[i]
+                right = level[i + 1] if i + 1 < L else (left if duplicate_last else left)
+                nxt.append(merkle_parent(left, right))
+                i += 2
+            level = tuple(nxt)
+            levels.append(level)
+        return MerkleTree(tuple(levels), duplicate_last)
+
+
+
+===== core/audit/audit_writer.py =====
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Mapping, Any
+from core.audit.audit_record import AuditRecord
+from core.typing import TenantId
+
+@dataclass(frozen=True)
+class AuditWriter:
+    def write(self, *, tenant_id: str, topic: str, payload: Mapping[str, Any], ts_ms: int | None = None, id: str | None = None) -> AuditRecord:
+        return AuditRecord.build(tenant_id=TenantId(tenant_id), topic=topic, payload=payload, ts_ms=ts_ms, id=id)
+
+
+
+===== core/audit/audit_record.py =====
+from __future__ import annotations
+import json
+import hashlib
+from dataclasses import dataclass
+from typing import Any, Mapping
+from core.errors import ValidationError
+from core.identity.uuid import uuid7_str
+from core.time.clock import now_ms
+from core.typing import JSONObject, TenantId
+
+
+def _to_canonical_json_bytes(obj: Any) -> bytes:
+    try:
+        s = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError('payload is not JSON-serializable', details={'error': str(exc)}) from exc
+    return s.encode('utf-8')
+
+
+def compute_payload_hash_hex(payload: Mapping[str, Any]) -> str:
+    data = _to_canonical_json_bytes(payload)
+    return hashlib.sha256(data).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class AuditRecord:
+    id: str
+    ts_ms: int
+    tenant_id: str
+    topic: str
+    payload: Mapping[str, Any]
+    hash: str
+    def to_dict(self) -> JSONObject:
+        return {
+            'id': self.id,
+            'ts_ms': int(self.ts_ms),
+            'tenant_id': self.tenant_id,
+            'topic': self.topic,
+            'payload': dict(self.payload),
+            'hash': self.hash,
+        }
+    @staticmethod
+    def build(*, tenant_id: str, topic: str, payload: Mapping[str, Any], ts_ms: int | None = None, id: str | None = None) -> 'AuditRecord':
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ValidationError('tenant_id must be a non-empty string')
+        if not isinstance(topic, str) or not topic.strip():
+            raise ValidationError('topic must be a non-empty string')
+        if not isinstance(payload, Mapping):
+            raise ValidationError('payload must be a mapping')
+        p_hash = compute_payload_hash_hex(payload)
+        return AuditRecord(
+            id=id or uuid7_str(),
+            ts_ms=int(ts_ms if ts_ms is not None else now_ms()),
+            tenant_id=TenantId(tenant_id),
+            topic=str(topic).strip().lower(),
+            payload=payload,
+            hash=p_hash,
+        )
+
+
+
+===== core/audit/__init__.py =====
+
+
+
+===== core/execution/transaction.py =====
+"""
+GA Enterprise Core — Logical Transaction Boundary
+-------------------------------------------------
+
+LAYER: L1
+Dependencies:
+- core.execution.execution_context
+- core.kernel.invariants
+
+Rules:
+- No DB logic
+- No commit/rollback
+- Pure scope wrapper
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from core.execution.execution_context import ExecutionContext
+from core.kernel.invariants import assert_not_none
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionBoundary:
+    """
+    Logical transaction boundary.
+
+    Responsible only for:
+    - Entering strict write mode
+    - Returning new execution context
+    """
+
+    execution_context: ExecutionContext
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.execution_context, "execution_context")
+
+    # -----------------------------------------------------
+    # Begin write transaction
+    # -----------------------------------------------------
+
+    def begin(self) -> ExecutionContext:
+        """
+        Returns a write-enabled execution context.
+        """
+        return self.execution_context.with_write_mode()
+
+
+===== core/execution/__init__.py =====
+"""
+GA Enterprise Core — Execution Layer
+
+LAYER: L1
+
+Purpose:
+- Deterministic execution boundary
+- Strict write enforcement
+- Logical transaction model
+"""
+
+from .execution_context import ExecutionContext
+from .strict_write import StrictWriteMode
+from .transaction import TransactionBoundary
+
+
+===== core/execution/strict_write.py =====
+"""
+GA Enterprise Core — Strict Write Enforcement
+---------------------------------------------
+
+LAYER: L1
+Dependencies:
+- core.execution.execution_context
+- core.errors
+
+Purpose:
+- Prevent write operations outside explicit write mode.
+"""
+
+from __future__ import annotations
+
+from core.execution.execution_context import ExecutionContext
+from core.errors import StrictWriteViolationError
+
+
+class StrictWriteMode:
+    """
+    Write enforcement authority.
+    """
+
+    @staticmethod
+    def require_write(ctx: ExecutionContext) -> None:
+        if not ctx.write_mode:
+            raise StrictWriteViolationError()
+
+
+===== core/execution/execution_context.py =====
+"""
+GA Enterprise Core — Execution Context
+--------------------------------------
+
+LAYER: L1
+Dependencies:
+- core.context
+- core.identity.uuid
+- core.time.clock
+- core.kernel.invariants
+- core.errors
+
+Rules:
+- Immutable
+- No hidden state
+- No global registry
+- No implicit time reads
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from core.context.request_context import RequestContext
+from core.identity.uuid import UUIDProvider
+from core.time.clock import Clock
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionContext:
+    """
+    Immutable execution boundary.
+
+    Represents:
+    - Request metadata
+    - Deterministic clock
+    - Deterministic UUID provider
+    - Write-mode state
+    """
+
+    request_context: RequestContext
+    clock: Clock
+    uuid_provider: UUIDProvider
+    write_mode: bool = False
+
+    # -----------------------------------------------------
+    # Validation
+    # -----------------------------------------------------
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.request_context, "request_context")
+        assert_not_none(self.clock, "clock")
+        assert_not_none(self.uuid_provider, "uuid_provider")
+
+    # -----------------------------------------------------
+    # Deterministic Helpers
+    # -----------------------------------------------------
+
+    def now(self):
+        """
+        Delegates to injected clock.
+        """
+        return self.clock.now_ms()
+
+    def with_write_mode(self) -> "ExecutionContext":
+        """
+        Returns a new ExecutionContext in strict write mode.
+        """
+        if self.write_mode:
+            raise InvariantViolationError("Already in write mode")
+
+        return ExecutionContext(
+            request_context=self.request_context,
+            clock=self.clock,
+            uuid_provider=self.uuid_provider,
+            write_mode=True,
+        )
+
+
+===== core/registry/services.py =====
+from __future__ import annotations
+import threading
+from functools import wraps
+from typing import Any, Callable, ParamSpec, TypeVar
+from core.errors import ValidationError
+from core.registry.registry import Registry
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+SERVICES: Registry[str, Any] = Registry()
+_instances: dict[str, Any] = {}
+_lock = threading.RLock()
+
+def register_service(key: str, obj_or_factory: Any) -> None:
+    if callable(obj_or_factory):
+        if getattr(obj_or_factory, '__code__', None) and obj_or_factory.__code__.co_argcount != 0:  # type: ignore[attr-defined]
+            raise ValidationError('service factory must be a zero-arg callable', details={'key': key, 'argcount': getattr(obj_or_factory, '__code__', None)})
+    SERVICES.register(key, obj_or_factory)
+
+
+def service(key: str) -> Callable[[Callable[[], R]], Callable[[], R]]:
+    def deco(fn: Callable[[], R]) -> Callable[[], R]:
+        if not callable(fn):
+            raise ValidationError('service must be callable', details={'key': key})
+        if fn.__code__.co_argcount != 0:  # type: ignore[attr-defined]
+            raise ValidationError('service factory must be zero-arg', details={'key': key})
+        register_service(key, fn)
+        @wraps(fn)
+        def wrapped() -> R:
+            return fn()
+        return wrapped
+    return deco
+
+
+def _resolve(key: str, value: Any) -> Any:
+    if not callable(value):
+        return value
+    with _lock:
+        if key in _instances:
+            return _instances[key]
+        instance = value()
+        _instances[key] = instance
+        return instance
+
+
+def get_service(key: str) -> Any:
+    value = SERVICES.require(key)
+    return _resolve(key, value)
+
+
+def try_get_service(key: str, default: Any | None = None) -> Any:
+    value = SERVICES.get(key)
+    if value is None:
+        return default
+    return _resolve(key, value)
+
+
+def replace_service(key: str, obj_or_factory: Any) -> None:
+    if callable(obj_or_factory):
+        if getattr(obj_or_factory, '__code__', None) and obj_or_factory.__code__.co_argcount != 0:  # type: ignore[attr-defined]
+            raise ValidationError('service factory must be zero-arg', details={'key': key, 'argcount': getattr(obj_or_factory, '__code__', None)})
+    with _lock:
+        _instances.pop(key, None)
+    SERVICES.replace(key, obj_or_factory)
+
+
+def resolved_snapshot() -> dict[str, str]:
+    with _lock:
+        return {k: type(v).__name__ for k, v in sorted(_instances.items())}
+
+
+
+===== core/registry/registry.py =====
+from __future__ import annotations
+import threading
+from typing import Any, Dict, Mapping, Optional, Tuple, TypeVar, Generic
+from core.errors import ValidationError, NotFoundError
+from core.kernel.freeze import assert_kernel_mutable
+
+K = TypeVar('K', bound=str)
+V = TypeVar('V')
+
+class Registry(Generic[K, V]):
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._items: Dict[K, V] = {}
+
+    @staticmethod
+    def _norm_key(key: K) -> K:
+        if not isinstance(key, str):
+            raise ValidationError('key must be a string', details={'type': type(key).__name__})
+        k = key.strip()
+        if not k:
+            raise ValidationError('key must be non-empty')
+        return k  # type: ignore[return-value]
+
+    def register(self, key: K, item: V) -> None:
+        k = self._norm_key(key)
+        with self._lock:
+            assert_kernel_mutable()
+            if k in self._items:
+                raise ValidationError('duplicate key', details={'key': k})
+            self._items[k] = item
+
+    def register_many(self, mapping: Mapping[K, V], *, overwrite: bool = False) -> None:
+        if not isinstance(mapping, Mapping):
+            raise ValidationError('mapping must be a Mapping')
+        items = {self._norm_key(k): v for k, v in mapping.items()}
+        with self._lock:
+            assert_kernel_mutable()
+            if not overwrite:
+                dups = [k for k in items.keys() if k in self._items]
+                if dups:
+                    raise ValidationError('duplicate keys', details={'keys': dups})
+            self._items.update(items)
+
+    def replace(self, key: K, item: V) -> None:
+        k = self._norm_key(key)
+        with self._lock:
+            assert_kernel_mutable()
+            if k not in self._items:
+                raise NotFoundError('key not found', details={'key': k})
+            self._items[k] = item
+
+    def unregister(self, key: K) -> bool:
+        k = self._norm_key(key)
+        with self._lock:
+            assert_kernel_mutable()
+            return self._items.pop(k, None) is not None
+
+    def clear(self) -> None:
+        with self._lock:
+            assert_kernel_mutable()
+            self._items.clear()
+
+    def get(self, key: K) -> Optional[V]:
+        k = self._norm_key(key)
+        with self._lock:
+            return self._items.get(k)
+
+    def require(self, key: K) -> V:
+        k = self._norm_key(key)
+        with self._lock:
+            if k not in self._items:
+                raise NotFoundError('key not found', details={'key': k})
+            return self._items[k]
+
+    def exists(self, key: K) -> bool:
+        k = self._norm_key(key)
+        with self._lock:
+            return k in self._items
+
+    def keys(self) -> Tuple[K, ...]:
+        with self._lock:
+            return tuple(sorted(self._items.keys()))
+
+    def values(self) -> Tuple[V, ...]:
+        with self._lock:
+            return tuple(self._items[k] for k in sorted(self._items.keys()))
+
+    def items(self) -> Tuple[Tuple[K, V], ...]:
+        with self._lock:
+            return tuple((k, self._items[k]) for k in sorted(self._items.keys()))
+
+    def list(self) -> Dict[K, V]:
+        with self._lock:
+            return {k: self._items[k] for k in sorted(self._items.keys())}
+
+    def snapshot(self) -> Dict[str, object]:
+        with self._lock:
+            keys = sorted(self._items.keys())
+            return {'size': len(self._items), 'keys': tuple(keys)}
+
+
+
+===== core/registry/handlers.py =====
+from __future__ import annotations
+from functools import wraps
+from typing import Callable, TypeVar, ParamSpec, Any
+from core.errors import ValidationError
+from core.registry.registry import Registry
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+HANDLERS: Registry[str, Callable[..., Any]] = Registry()
+
+def register_handler(key: str, fn: Callable[..., Any]) -> None:
+    if not callable(fn):
+        raise ValidationError('handler must be callable', details={'key': key})
+    HANDLERS.register(key, fn)
+
+
+def handler(key: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    def deco(fn: Callable[P, R]) -> Callable[P, R]:
+        if not callable(fn):
+            raise ValidationError('handler must be callable', details={'key': key})
+        HANDLERS.register(key, fn)
+        @wraps(fn)
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            return fn(*args, **kwargs)
+        return wrapped
+    return deco
+
+
+def get_handler(key: str) -> Callable[..., Any]:
+    return HANDLERS.require(key)
+
+
+
+===== core/registry/__init__.py =====
+
+
+
+===== core/registry/freeze_guard.py =====
+from __future__ import annotations
+from functools import wraps
+from typing import Callable, ParamSpec, TypeVar
+from core.kernel.freeze import assert_kernel_mutable
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+__all__ = ['assert_kernel_mutable', 'guard_mutation']
+
+def guard_mutation(fn: Callable[P, R]) -> Callable[P, R]:
+    @wraps(fn)
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        assert_kernel_mutable()
+        return fn(*args, **kwargs)
+    return wrapped
+
+
+
+===== core/registry/base.py =====
+from __future__ import annotations
+from typing import Any, Protocol
+
+class Registrable(Protocol):
+    key: str
+    def __repr__(self) -> str:  # pragma: no cover
+        ...
+
+
+
+===== core/errors/__init__.py =====
+"""
+GA Enterprise Core — Deterministic Error Hierarchy
+--------------------------------------------------
+
+LAYER: L0 (Bedrock)
+Dependencies: stdlib only
+Deterministic: YES
+Infrastructure: NONE
+Time access: NONE
+UUID access: NONE
+
+Rules:
+- All core errors must derive from CoreError.
+- Errors must be immutable.
+- Errors must be reproducible (no dynamic message mutation).
+- No side effects.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+
+# ============================================================
+# Base Error
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class CoreError(Exception):
+    """
+    Root deterministic error for the entire GA core.
+
+    Invariants:
+    - Immutable
+    - Message deterministic
+    - No contextual mutation
+    """
+
+    message: str
+    code: str
+    cause: Optional[Exception] = None
+
+    def __str__(self) -> str:
+        return f"[{self.code}] {self.message}"
+
+
+# ============================================================
+# Kernel Errors
+# ============================================================
+
+class KernelFrozenError(CoreError):
+    """Raised when mutation occurs after kernel freeze."""
+
+    def __init__(self, message: str = "Kernel is frozen and cannot be modified"):
+        super().__init__(
+            message=message,
+            code="KERNEL_FROZEN",
+        )
+
+
+class InvariantViolationError(CoreError):
+    """Raised when a kernel invariant is violated."""
+
+    def __init__(self, message: str):
+        super().__init__(
+            message=message,
+            code="INVARIANT_VIOLATION",
+        )
+
+
+# ============================================================
+# Validation Errors
+# ============================================================
+
+class ValidationError(CoreError):
+    """Input or structural validation failure."""
+
+    def __init__(self, message: str):
+        super().__init__(
+            message=message,
+            code="VALIDATION_ERROR",
+        )
+
+
+class GrammarViolationError(CoreError):
+    """Raised when a grammar rule (regex authority) is violated."""
+
+    def __init__(self, message: str):
+        super().__init__(
+            message=message,
+            code="GRAMMAR_VIOLATION",
+        )
+
+
+# ============================================================
+# Authorization / Governance
+# ============================================================
+
+class AuthorizationError(CoreError):
+    """Raised when access control denies execution."""
+
+    def __init__(self, message: str = "Access denied"):
+        super().__init__(
+            message=message,
+            code="AUTHORIZATION_DENIED",
+        )
+
+
+class TenantIsolationError(CoreError):
+    """Raised when cross-tenant access is attempted."""
+
+    def __init__(self, message: str = "Tenant isolation violation"):
+        super().__init__(
+            message=message,
+            code="TENANT_ISOLATION_VIOLATION",
+        )
+
+
+# ============================================================
+# Execution Discipline
+# ============================================================
+
+class StrictWriteViolationError(CoreError):
+    """Raised when write operation occurs outside write-mode."""
+
+    def __init__(self, message: str = "Write operation outside strict write mode"):
+        super().__init__(
+            message=message,
+            code="STRICT_WRITE_VIOLATION",
+        )
+
+
+class IdempotencyViolationError(CoreError):
+    """Raised when idempotency constraints are violated."""
+
+    def __init__(self, message: str):
+        super().__init__(
+            message=message,
+            code="IDEMPOTENCY_VIOLATION",
+        )
+
+
+===== core/events/event.py =====
+"""
+GA Enterprise Core — Immutable Domain Event
+-------------------------------------------
+
+LAYER: L2
+Dependencies:
+- core.typing
+- core.kernel.invariants
+
+Rules:
+- Immutable
+- No time access
+- No ID generation
+- No mutation
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Mapping, Any
+
+from core.typing import EventId
+from core.kernel.invariants import assert_not_none
+
+
+@dataclass(frozen=True, slots=True)
+class DomainEvent:
+    """
+    Immutable domain event.
+
+    event_id must be injected.
+    payload must be deterministic.
+    """
+
+    event_id: EventId
+    event_type: str
+    payload: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.event_id, "event_id")
+        assert_not_none(self.event_type, "event_type")
+        assert_not_none(self.payload, "payload")
+
+    def to_dict(self) -> dict[str, Any]:
+        """
+        Deterministic serialization.
+        """
+        return {
+            "event_id": str(self.event_id),
+            "event_type": self.event_type,
+            "payload": dict(self.payload),
+        }
+
+
+===== core/events/__init__.py =====
+"""
+GA Enterprise Core — Event Spine
+
+LAYER: L2
+
+Purpose:
+- Immutable domain events
+- Canonical event envelopes
+- Deterministic hashing
+- In-process dispatcher (no IO)
+"""
+
+from .event import DomainEvent
+from .headers import EventHeaders
+from .envelope import EventEnvelope
+from .bus import InProcessEventBus
+
+
+===== core/events/bus.py =====
+"""
+GA Enterprise Core — In-Process Event Bus
+-----------------------------------------
+
+LAYER: L2
+Dependencies:
+- core.events.envelope
+- core.kernel.invariants
+
+Rules:
+- No threading
+- No async
+- No IO
+- Deterministic ordering
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import Callable, Dict, List
+
+from core.events.envelope import EventEnvelope
+from core.kernel.invariants import assert_not_none
+
+
+EventHandler = Callable[[EventEnvelope], None]
+
+
+class InProcessEventBus:
+    """
+    Deterministic in-process event dispatcher.
+    """
+
+    def __init__(self) -> None:
+        self._handlers: Dict[str, List[EventHandler]] = defaultdict(list)
+
+    # -----------------------------------------------------
+    # Registration
+    # -----------------------------------------------------
+
+    def register(self, event_type: str, handler: EventHandler) -> None:
+        assert_not_none(event_type, "event_type")
+        assert_not_none(handler, "handler")
+
+        self._handlers[event_type].append(handler)
+
+    # -----------------------------------------------------
+    # Dispatch
+    # -----------------------------------------------------
+
+    def dispatch(self, envelope: EventEnvelope) -> None:
+        assert_not_none(envelope, "envelope")
+
+        handlers = self._handlers.get(envelope.event.event_type, [])
+
+        # deterministic ordering (registration order preserved)
+        for handler in handlers:
+            handler(envelope)
+
+
+===== core/events/headers.py =====
+"""
+GA Enterprise Core — Event Headers
+----------------------------------
+
+LAYER: L2
+Dependencies:
+- core.typing
+- core.kernel.invariants
+
+Rules:
+- Immutable
+- Canonical fields only
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from core.typing import (
+    CorrelationId,
+    CausationId,
+    TenantId,
+    UnixMillis,
+)
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError
+
+
+@dataclass(frozen=True, slots=True)
+class EventHeaders:
+    """
+    Canonical event headers.
+    """
+
+    correlation_id: CorrelationId
+    causation_id: CausationId
+    timestamp_ms: UnixMillis
+    tenant_id: TenantId | None = None
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.correlation_id, "correlation_id")
+        assert_not_none(self.causation_id, "causation_id")
+        assert_not_none(self.timestamp_ms, "timestamp_ms")
+
+        if self.timestamp_ms < 0:
+            raise InvariantViolationError("timestamp_ms cannot be negative")
+
+    def to_dict(self) -> dict[str, str | int | None]:
+        return {
+            "correlation_id": str(self.correlation_id),
+            "causation_id": str(self.causation_id),
+            "timestamp_ms": int(self.timestamp_ms),
+            "tenant_id": str(self.tenant_id) if self.tenant_id else None,
+        }
+
+
+===== core/events/envelope.py =====
+"""
+GA Enterprise Core — Deterministic Event Envelope
+-------------------------------------------------
+
+LAYER: L2
+Dependencies:
+- core.events.event
+- core.events.headers
+- stdlib hashlib/json
+
+Rules:
+- Immutable
+- Deterministic hash
+- Canonical JSON encoding
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+
+from core.events.event import DomainEvent
+from core.events.headers import EventHeaders
+from core.kernel.invariants import assert_not_none
+
+
+@dataclass(frozen=True, slots=True)
+class EventEnvelope:
+    """
+    Immutable event envelope.
+
+    Combines:
+    - DomainEvent
+    - EventHeaders
+    - Deterministic content hash
+    """
+
+    event: DomainEvent
+    headers: EventHeaders
+    content_hash: str
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.event, "event")
+        assert_not_none(self.headers, "headers")
+        assert_not_none(self.content_hash, "content_hash")
+
+    # -----------------------------------------------------
+    # Factory
+    # -----------------------------------------------------
+
+    @staticmethod
+    def create(event: DomainEvent, headers: EventHeaders) -> "EventEnvelope":
+        """
+        Creates deterministic envelope with canonical hash.
+        """
+
+        canonical = {
+            "event": event.to_dict(),
+            "headers": headers.to_dict(),
+        }
+
+        encoded = json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        digest = hashlib.sha256(encoded).hexdigest()
+
+        return EventEnvelope(
+            event=event,
+            headers=headers,
+            content_hash=digest,
+        )
+
+
+===== core/guards/idempotency.py =====
+from __future__ import annotations
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, Protocol, Tuple, Dict, TypeVar, ParamSpec
+from core.errors import ValidationError, IdempotencyViolation
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+class IdempotencyStore(Protocol):
+    def put_if_absent(self, key: str, ttl_seconds: int) -> bool: ...
+    def get(self, key: str) -> Optional[Tuple[int, Any]]: ...
+    def set_result(self, key: str, value: Any) -> None: ...
+    def purge_expired(self, now_epoch_sec: Optional[int] = None) -> None: ...
+
+
+@dataclass
+class MemoryIdempotencyStore(IdempotencyStore):
+    _data: Dict[str, Tuple[int, Any]] = None  # type: ignore[assignment]
+    def __post_init__(self) -> None:
+        object.__setattr__(self, '_data', {})
+        object.__setattr__(self, '_lock', threading.RLock())
+    def _now(self) -> int:
+        return int(time.time())
+    def put_if_absent(self, key: str, ttl_seconds: int) -> bool:
+        with self._lock:
+            self.purge_expired()
+            if key in self._data:
+                return False
+            self._data[key] = (self._now() + int(ttl_seconds), None)
+            return True
+    def get(self, key: str) -> Optional[Tuple[int, Any]]:
+        with self._lock:
+            self.purge_expired()
+            return self._data.get(key)
+    def set_result(self, key: str, value: Any) -> None:
+        with self._lock:
+            if key in self._data:
+                exp, _ = self._data[key]
+                self._data[key] = (exp, value)
+    def purge_expired(self, now_epoch_sec: Optional[int] = None) -> None:
+        now = int(now_epoch_sec if now_epoch_sec is not None else self._now())
+        with self._lock:
+            to_del = [k for k, (exp, _) in self._data.items() if exp <= now]
+            for k in to_del:
+                del self._data[k]
+
+
+def _require_key(key: Any) -> str:
+    if not isinstance(key, str):
+        raise ValidationError('idempotency key must be a string', details={'type': type(key).__name__})
+    k = key.strip()
+    if not k:
+        raise ValidationError('idempotency key must be non-empty')
+    if len(k) > 256:
+        raise ValidationError('idempotency key too long', details={'max': 256})
+    return k
+
+
+def idempotent(key_fn: Callable[P, str], *, store: IdempotencyStore, ttl_seconds: int = 3600, on_duplicate: str = 'return_cached') -> Callable[[Callable[P, R]], Callable[P, Optional[R]]]:
+    if on_duplicate not in ('raise', 'return_none', 'return_cached'):
+        raise ValidationError('invalid on_duplicate value', details={'allowed': ['raise', 'return_none', 'return_cached']})
+    def decorator(fn: Callable[P, R]) -> Callable[P, Optional[R]]:
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> Optional[R]:
+            key_raw = key_fn(*args, **kwargs)
+            key = _require_key(key_raw)
+            created = store.put_if_absent(key, int(ttl_seconds))
+            if not created:
+                if on_duplicate == 'raise':
+                    raise IdempotencyViolation('duplicate request', details={'key': key})
+                if on_duplicate == 'return_cached':
+                    cached = store.get(key)
+                    if cached is not None:
+                        _, value = cached
+                        return value if value is not None else None
+                return None
+            result = fn(*args, **kwargs)
+            if on_duplicate == 'return_cached':
+                store.set_result(key, result)
+            return result
+        return wrapped
+    return decorator
+
+
+
+===== core/guards/__init__.py =====
+
+
+
+===== core/guards/circuit_breaker.py =====
+from __future__ import annotations
+from time import monotonic
+from dataclasses import dataclass
+from typing import Callable, TypeVar, ParamSpec
+from threading import RLock
+from core.errors import PermissionDenied, ValidationError
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+@dataclass
+class CircuitBreaker:
+    failures: int = 5
+    reset_seconds: float = 30.0
+    def __post_init__(self) -> None:
+        if not isinstance(self.failures, int) or self.failures < 1:
+            raise ValidationError('failures must be >= 1')
+        if not isinstance(self.reset_seconds, (int, float)) or self.reset_seconds <= 0:
+            raise ValidationError('reset_seconds must be > 0')
+        object.__setattr__(self, '_fail_count', 0)
+        object.__setattr__(self, '_opened_at', None)
+        object.__setattr__(self, '_half_open_trial', False)
+        object.__setattr__(self, '_lock', RLock())
+    def allow(self) -> None:
+        with self._lock:
+            if self._opened_at is None:
+                return
+            elapsed = monotonic() - self._opened_at
+            if elapsed < self.reset_seconds:
+                raise PermissionDenied('circuit open')
+            self._half_open_trial = True
+    def mark_success(self) -> None:
+        with self._lock:
+            self._fail_count = 0
+            if self._opened_at is not None and self._half_open_trial:
+                self._opened_at = None
+                self._half_open_trial = False
+    def mark_failure(self) -> None:
+        with self._lock:
+            if self._opened_at is None:
+                self._fail_count += 1
+                if self._fail_count >= self.failures:
+                    self._opened_at = monotonic()
+                    self._half_open_trial = False
+                    self._fail_count = 0
+            else:
+                self._opened_at = monotonic()
+                self._half_open_trial = False
+                self._fail_count = 0
+    def protect(self, fn: Callable[P, R]) -> Callable[P, R]:
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            self.allow()
+            try:
+                result = fn(*args, **kwargs)
+            except Exception:
+                self.mark_failure()
+                raise
+            else:
+                self.mark_success()
+                return result
+        return wrapped
+
+
+
+===== core/guards/rate_limit.py =====
+from __future__ import annotations
+from time import monotonic
+from typing import Dict
+from threading import RLock
+from core.errors import PermissionDenied, ValidationError
+
+class TokenBucket:
+    __slots__ = ('rate', 'cap', 'tokens', 't')
+    def __init__(self, rate_per_sec: float, capacity: int):
+        if not isinstance(rate_per_sec, (int, float)) or rate_per_sec <= 0:
+            raise ValidationError('rate_per_sec must be > 0')
+        if not isinstance(capacity, int) or capacity < 1:
+            raise ValidationError('capacity must be >= 1')
+        self.rate = float(rate_per_sec)
+        self.cap = int(capacity)
+        self.tokens = float(capacity)
+        self.t = monotonic()
+    def allow(self) -> bool:
+        now = monotonic()
+        self.tokens = min(self.cap, self.tokens + (now - self.t) * self.rate)
+        self.t = now
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+
+class RateLimiter:
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._buckets: Dict[str, TokenBucket] = {}
+    def require(self, key: str, *, rate_per_sec: float = 5.0, capacity: int = 10) -> None:
+        if not isinstance(key, str) or not key.strip():
+            raise ValidationError('key must be a non-empty string')
+        with self._lock:
+            b = self._buckets.get(key)
+            if b is None:
+                b = TokenBucket(rate_per_sec, capacity)
+                self._buckets[key] = b
+            ok = b.allow()
+            if not ok:
+                raise PermissionDenied('rate limit exceeded', details={'key': key, 'rate': rate_per_sec, 'capacity': capacity})
+
+_GLOBAL = RateLimiter()
+
+def require_rate(key: str, *, rate_per_sec: float = 5.0, capacity: int = 10) -> None:
+    _GLOBAL.require(key, rate_per_sec=rate_per_sec, capacity=capacity)
+
+
+
+===== core/guards/preconditions.py =====
+from __future__ import annotations
+from typing import Iterable, Mapping, Sequence, Sized, Any, Optional
+from core.errors import ValidationError
+
+
+def require(condition: bool, *, message: str = 'Precondition failed', **details) -> None:
+    if not condition:
+        raise ValidationError(message, details=details)
+
+
+def require_non_empty_str(name: str, value: Any, *, max_len: Optional[int] = None) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f'{name} must be a string', details={'field': name, 'type': type(value).__name__})
+    v = value.strip()
+    if not v:
+        raise ValidationError(f'{name} must be non-empty', details={'field': name})
+    if max_len is not None and len(v) > max_len:
+        raise ValidationError(f'{name} too long', details={'field': name, 'max': max_len, 'len': len(v)})
+    return v
+
+
+def require_mapping(name: str, value: Any) -> Mapping[Any, Any]:
+    if not isinstance(value, Mapping):
+        raise ValidationError(f'{name} must be a mapping (dict-like)', details={'field': name, 'type': type(value).__name__})
+    return value
+
+
+def require_sequence(name: str, value: Any) -> Sequence[Any]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValidationError(f'{name} must be a sequence', details={'field': name, 'type': type(value).__name__})
+    return value
+
+
+def require_non_empty_collection(name: str, value: Any) -> Sized:
+    if not hasattr(value, '__len__'):
+        raise ValidationError(f'{name} must be a sized collection', details={'field': name, 'type': type(value).__name__})
+    if len(value) <= 0:  # type: ignore[arg-type]
+        raise ValidationError(f'{name} must be non-empty', details={'field': name})
+    return value  # type: ignore[return-value]
+
+
+def require_positive_int(name: str, value: Any, *, allow_zero: bool = False) -> int:
+    if not isinstance(value, int):
+        raise ValidationError(f'{name} must be an int', details={'field': name, 'type': type(value).__name__})
+    if allow_zero and value < 0:
+        raise ValidationError(f'{name} must be >= 0', details={'field': name, 'value': value})
+    if not allow_zero and value <= 0:
+        raise ValidationError(f'{name} must be > 0', details={'field': name, 'value': value})
+    return value
+
+
+def require_in_range(name: str, value: Any, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+    if not isinstance(value, (int, float)):
+        raise ValidationError(f'{name} must be numeric', details={'field': name, 'type': type(value).__name__})
+    if min_value is not None and value < min_value:
+        raise ValidationError(f'{name} smaller than minimum', details={'field': name, 'min': min_value, 'value': value})
+    if max_value is not None and value > max_value:
+        raise ValidationError(f'{name} greater than maximum', details={'field': name, 'max': max_value, 'value': value})
+    return float(value)
+
+
+def require_enum(name: str, value: Any, allowed: Iterable[Any]) -> Any:
+    choices = tuple(allowed)
+    if value not in choices:
+        raise ValidationError(f'{name} must be one of {choices!r}', details={'field': name, 'value': value, 'allowed': choices})
+    return value
+
+
+
+===== core/kernel/__init__.py =====
+"""
+GA Enterprise Core — Kernel Authority
+
+LAYER: L0
+Purpose:
+- Global freeze control
+- Kernel invariant enforcement
+"""
+
+from .freeze import (
+    freeze_kernel,
+    is_kernel_frozen,
+    assert_kernel_mutable,
+)
+
+from .invariants import (
+    assert_invariant,
+    assert_not_none,
+    assert_true,
+)
+
+
+===== core/kernel/freeze.py =====
+"""
+GA Enterprise Core — Global Freeze Authority
+--------------------------------------------
+
+LAYER: L0
+Dependencies: core.errors only
+Deterministic: YES
+Threading: NONE (by design)
+IO: NONE
+
+Rules:
+- Freeze is irreversible.
+- Freeze is global.
+- No auto-freeze.
+- No implicit mutation.
+- Freeze must be explicit.
+"""
+
+from __future__ import annotations
+
+from typing import Final
+
+from core.errors import KernelFrozenError
+
+
+# ============================================================
+# Internal Freeze State
+# ============================================================
+
+# Private module-level state.
+# Not exposed. Not mutable from outside.
+_KERNEL_FROZEN: bool = False
+
+FREEZE_SENTINEL: Final[str] = "GA_KERNEL_FROZEN_V1"
+
+
+# ============================================================
+# Public API
+# ============================================================
+
+def freeze_kernel() -> str:
+    """
+    Irreversibly freezes the kernel.
+
+    Returns:
+        A deterministic sentinel string for audit purposes.
+
+    Raises:
+        KernelFrozenError: if already frozen.
+    """
+    global _KERNEL_FROZEN
+
+    if _KERNEL_FROZEN:
+        raise KernelFrozenError("Kernel is already frozen")
+
+    _KERNEL_FROZEN = True
+    return FREEZE_SENTINEL
+
+
+def is_kernel_frozen() -> bool:
+    """
+    Returns current freeze state.
+    Pure read. No mutation.
+    """
+    return _KERNEL_FROZEN
+
+
+def assert_kernel_mutable() -> None:
+    """
+    Raises if the kernel has been frozen.
+
+    Must be called by:
+    - Registries
+    - Grammar authorities
+    - Policy mutation points
+    """
+    if _KERNEL_FROZEN:
+        raise KernelFrozenError()
+
+
+===== core/kernel/invariants.py =====
+"""
+GA Enterprise Core — Kernel Invariant Enforcement
+-------------------------------------------------
+
+LAYER: L0
+Dependencies: core.errors only
+Deterministic: YES
+Side effects: NONE
+
+Purpose:
+- Replace raw `assert` statements
+- Provide deterministic invariant failures
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from core.errors import InvariantViolationError
+
+
+# ============================================================
+# Base Invariant
+# ============================================================
+
+def assert_invariant(condition: bool, message: str) -> None:
+    """
+    Enforces a deterministic invariant.
+
+    Raises:
+        InvariantViolationError if condition is False.
+    """
+    if not condition:
+        raise InvariantViolationError(message)
+
+
+# ============================================================
+# Common Assertions
+# ============================================================
+
+def assert_not_none(value: Any, name: str) -> None:
+    """
+    Ensures a value is not None.
+    """
+    if value is None:
+        raise InvariantViolationError(f"{name} must not be None")
+
+
+def assert_true(condition: bool, message: str) -> None:
+    """
+    Alias for explicit boolean checks.
+    """
+    if condition is not True:
+        raise InvariantViolationError(message)
+
+

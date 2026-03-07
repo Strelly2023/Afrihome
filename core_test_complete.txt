@@ -1,0 +1,3929 @@
+===== core/outbox/dispatcher.py =====
+
+"""
+GA Enterprise Core — Outbox Dispatcher (Pure State)
+---------------------------------------------------
+
+LAYER: L2
+Dependencies:
+- core.outbox.store_protocol
+- core.outbox.model
+- core.outbox.backoff
+- core.events.envelope
+- core.kernel.invariants
+- core.typing
+
+Rules:
+- No IO
+- No threads/async
+- Deterministic ordering
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+from core.outbox.store_protocol import OutboxStore
+from core.outbox.model import OutboxRecord, OutboxStatus
+from core.outbox.backoff import BackoffPolicy, compute_backoff_ms
+from core.events.envelope import EventEnvelope
+from core.kernel.invariants import assert_not_none
+from core.typing import EventId, UnixMillis
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchItem:
+    event_id: EventId
+    topic: str
+    envelope: EventEnvelope
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchPlan:
+    items: List[DispatchItem]
+
+
+def plan_dispatch(
+    store: OutboxStore,
+    topic: str,
+    now_ms: UnixMillis,
+    limit: int,
+) -> DispatchPlan:
+    assert_not_none(store, "store")
+    assert_not_none(topic, "topic")
+    assert_not_none(now_ms, "now_ms")
+    assert limit > 0, "limit must be positive"
+    eligible = store.get_eligible(topic, now_ms, limit)
+    items = [DispatchItem(r.event_id, r.topic, r.envelope) for r in eligible]
+    return DispatchPlan(items=items)
+
+
+def apply_success(store: OutboxStore, event_id: EventId) -> OutboxRecord:
+    rec = store.get(event_id)
+    assert_not_none(rec, "record")
+    assert rec.status is OutboxStatus.PENDING, "cannot dispatch non-pending record"
+    updated = rec.mark_dispatched()
+    store.put(updated)
+    return updated
+
+
+def apply_failure(
+    store: OutboxStore,
+    event_id: EventId,
+    now_ms: UnixMillis,
+    policy: BackoffPolicy = BackoffPolicy(),
+    error: str | None = None,
+) -> OutboxRecord:
+    rec = store.get(event_id)
+    assert_not_none(rec, "record")
+    assert rec.status is OutboxStatus.PENDING, "cannot fail non-pending record"
+    next_delay = compute_backoff_ms(rec.attempts + 1, policy)
+    updated = rec.schedule_retry(now_ms=now_ms, next_delay_ms=next_delay, error=error)
+    store.put(updated)
+    return updated
+
+
+
+===== core/outbox/topic_grammar.py =====
+
+"""
+GA Enterprise Core — Outbox Topic Grammar
+-----------------------------------------
+
+LAYER: L2
+Dependencies: core.errors (L0)
+Deterministic: YES
+IO: NONE
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Final
+
+from core.errors import GrammarViolationError
+
+TOPIC_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$")
+
+def normalize_topic(topic: str) -> str:
+    if topic is None:
+        raise GrammarViolationError("Topic must not be None")
+    t = topic.strip().lower()
+    return t
+
+def is_valid_topic(topic: str) -> bool:
+    t = normalize_topic(topic)
+    return bool(TOPIC_PATTERN.match(t))
+
+def validate_topic(topic: str) -> str:
+    t = normalize_topic(topic)
+    if not TOPIC_PATTERN.match(t):
+        raise GrammarViolationError(f"Invalid topic: {topic!r}")
+    return t
+
+
+
+===== core/outbox/memory_store.py =====
+
+"""
+GA Enterprise Core — In-Memory Outbox Store
+-------------------------------------------
+
+LAYER: L2
+Dependencies: core.outbox.store_protocol, core.outbox.model, core.typing
+IO: NONE
+Threads/async: NONE
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
+from core.outbox.store_protocol import OutboxStore
+from core.outbox.model import OutboxRecord, OutboxStatus
+from core.typing import UnixMillis, EventId
+
+
+class InMemoryOutboxStore(OutboxStore):
+    def __init__(self) -> None:
+        self._by_id: Dict[str, OutboxRecord] = {}
+        self._by_topic: Dict[str, List[str]] = {}
+
+    def append(self, record: OutboxRecord) -> None:
+        eid = str(record.event_id)
+        if eid in self._by_id:
+            raise ValueError(f"OutboxRecord with event_id {eid} already exists")
+        self._by_id[eid] = record
+        self._by_topic.setdefault(record.topic, []).append(eid)
+
+    def put(self, record: OutboxRecord) -> None:
+        eid = str(record.event_id)
+        if eid not in self._by_id:
+            raise KeyError(f"OutboxRecord {eid} not found")
+        self._by_id[eid] = record
+        if eid not in self._by_topic.get(record.topic, []):
+            for t, lst in self._by_topic.items():
+                if eid in lst:
+                    lst.remove(eid)
+            self._by_topic.setdefault(record.topic, []).append(eid)
+
+    def get(self, event_id: EventId):
+        return self._by_id.get(str(event_id))
+
+    def get_eligible(self, topic: str, now_ms: UnixMillis, limit: int) -> List[OutboxRecord]:
+        ids = self._by_topic.get(topic, [])
+        recs = [
+            self._by_id[eid]
+            for eid in ids
+            if (r := self._by_id[eid]).status is OutboxStatus.PENDING and r.next_attempt_ms <= now_ms
+        ]
+        recs.sort(key=lambda r: (int(r.next_attempt_ms), str(r.event_id)))
+        return recs[: max(0, limit)]
+
+
+
+===== core/outbox/__init__.py =====
+
+"""
+GA Enterprise Core — Outbox Durability Spine
+
+LAYER: L2
+
+Purpose:
+- Canonical topic grammar
+- Deterministic outbox record model
+- Store protocol (no IO assumptions)
+- Deterministic backoff (no sleeps, no randomness)
+- Pure dispatcher state machine (plan + apply)
+- In-memory store for testing/in-process usage
+"""
+
+from .topic_grammar import (
+    normalize_topic, validate_topic, is_valid_topic, TOPIC_PATTERN,
+)
+from .model import OutboxStatus, OutboxRecord
+from .store_protocol import OutboxStore
+from .backoff import BackoffPolicy, compute_backoff_ms
+from .writer import write_outbox_record
+from .dispatcher import (
+    DispatchItem, DispatchPlan, plan_dispatch, apply_success, apply_failure,
+)
+from .memory_store import InMemoryOutboxStore
+
+__all__ = [
+    "normalize_topic", "validate_topic", "is_valid_topic", "TOPIC_PATTERN",
+    "OutboxStatus", "OutboxRecord",
+    "OutboxStore",
+    "BackoffPolicy", "compute_backoff_ms",
+    "write_outbox_record",
+    "DispatchItem", "DispatchPlan", "plan_dispatch", "apply_success", "apply_failure",
+    "InMemoryOutboxStore",
+]
+
+
+
+===== core/outbox/backoff.py =====
+
+"""
+GA Enterprise Core — Deterministic Backoff
+------------------------------------------
+
+LAYER: L2
+Dependencies: stdlib only
+Randomness: FORBIDDEN
+Sleep: FORBIDDEN
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True, slots=True)
+class BackoffPolicy:
+    base_ms: int = 100
+    factor: int = 2
+    max_ms: int = 60_000
+
+def compute_backoff_ms(attempt: int, policy: BackoffPolicy = BackoffPolicy()) -> int:
+    if attempt <= 0:
+        return 0
+    delay = policy.base_ms * (policy.factor ** (attempt - 1))
+    if delay > policy.max_ms:
+        delay = policy.max_ms
+    return int(delay)
+
+
+
+===== core/outbox/model.py =====
+
+"""
+GA Enterprise Core — Outbox Model
+---------------------------------
+
+LAYER: L2
+Dependencies: L0+L1 (core.typing, core.errors), core.events
+Deterministic: YES
+IO: NONE
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Optional
+
+from core.typing import UnixMillis, EventId
+from core.events.envelope import EventEnvelope
+from core.errors import InvariantViolationError
+
+
+class OutboxStatus(Enum):
+    PENDING = auto()
+    DISPATCHED = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxRecord:
+    event_id: EventId
+    topic: str
+    envelope: EventEnvelope
+    attempts: int
+    next_attempt_ms: UnixMillis
+    status: OutboxStatus = OutboxStatus.PENDING
+    last_error: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.attempts < 0:
+            raise InvariantViolationError("attempts cannot be negative")
+        if self.next_attempt_ms < 0:
+            raise InvariantViolationError("next_attempt_ms cannot be negative")
+        if not self.topic:
+            raise InvariantViolationError("topic cannot be empty")
+
+    def mark_dispatched(self) -> "OutboxRecord":
+        return OutboxRecord(
+            event_id=self.event_id,
+            topic=self.topic,
+            envelope=self.envelope,
+            attempts=self.attempts,
+            next_attempt_ms=self.next_attempt_ms,
+            status=OutboxStatus.DISPATCHED,
+            last_error=None,
+        )
+
+    def schedule_retry(self, now_ms: UnixMillis, next_delay_ms: int, error: Optional[str]) -> "OutboxRecord":
+        if now_ms < 0 or next_delay_ms < 0:
+            raise InvariantViolationError("now_ms and next_delay_ms must be non-negative")
+        return OutboxRecord(
+            event_id=self.event_id,
+            topic=self.topic,
+            envelope=self.envelope,
+            attempts=self.attempts + 1,
+            next_attempt_ms=UnixMillis(int(now_ms) + int(next_delay_ms)),
+            status=OutboxStatus.PENDING,
+            last_error=error,
+        )
+
+
+
+===== core/outbox/store_protocol.py =====
+
+"""
+GA Enterprise Core — Outbox Store Protocol
+------------------------------------------
+
+LAYER: L2
+Dependencies: core.typing, core.outbox.model
+IO: NONE (protocol only)
+"""
+
+from __future__ import annotations
+
+from typing import List, Optional
+
+from core.typing import UnixMillis, EventId
+from core.outbox.model import OutboxRecord
+
+
+class OutboxStore:
+    """
+    Outbox store protocol.
+
+    Implementations MUST be deterministic for the same sequence of inputs.
+    No background behavior. No IO in core; infra layer may implement persistence.
+    """
+
+    def append(self, record: OutboxRecord) -> None: ...
+    def put(self, record: OutboxRecord) -> None: ...
+
+    def get(self, event_id: EventId) -> Optional[OutboxRecord]: ...
+    def get_eligible(self, topic: str, now_ms: UnixMillis, limit: int) -> List[OutboxRecord]: ...
+
+
+
+===== core/outbox/writer.py =====
+
+"""
+GA Enterprise Core — Outbox Writer
+----------------------------------
+
+LAYER: L2
+Dependencies:
+- core.outbox.topic_grammar
+- core.outbox.model
+- core.outbox.store_protocol
+- core.events.envelope
+- core.typing
+
+IO: NONE
+"""
+
+from __future__ import annotations
+
+from core.outbox.topic_grammar import validate_topic
+from core.outbox.model import OutboxRecord
+from core.outbox.store_protocol import OutboxStore
+from core.events.envelope import EventEnvelope
+from core.typing import UnixMillis
+
+
+def write_outbox_record(
+    store: OutboxStore,
+    topic: str,
+    envelope: EventEnvelope,
+    now_ms: UnixMillis,
+) -> OutboxRecord:
+    t = validate_topic(topic)
+    rec = OutboxRecord(
+        event_id=envelope.event.event_id,
+        topic=t,
+        envelope=envelope,
+        attempts=0,
+        next_attempt_ms=now_ms,
+    )
+    store.append(rec)
+    return rec
+
+
+
+===== core/rbac/policy_engine.py =====
+
+"""
+GA Enterprise Core — RBAC Policy Engine (Deny-Wins)
+---------------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.rbac.roles
+- core.rbac.permissions
+- core.typing
+- core.kernel.invariants
+- core.errors
+
+Deterministic: YES
+No tenancy imports: ENFORCED
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Tuple, Optional
+
+from core.rbac.roles import Role
+from core.rbac.permissions import permission_matches
+from core.typing import RoleName, Permission, UserId
+from core.kernel.invariants import assert_not_none
+
+
+@dataclass(frozen=True, slots=True)
+class Subject:
+    user_id: Optional[UserId]
+    roles: Tuple[RoleName, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Policy:
+    roles: Dict[str, Role]
+
+
+@dataclass(frozen=True, slots=True)
+class Decision:
+    allowed: bool
+    reason: str
+    role: Optional[RoleName] = None
+    pattern: Optional[str] = None
+
+
+class PolicyEngine:
+    def evaluate(self, policy: Policy, subject: Subject, permission: Permission) -> Decision:
+        assert_not_none(policy, "policy")
+        assert_not_none(subject, "subject")
+        assert_not_none(permission, "permission")
+        perm = str(permission)
+        for rn in subject.roles:
+            role = policy.roles.get(str(rn))
+            if role is None:
+                continue
+            for pat in role.deny:
+                if permission_matches(pat, perm):
+                    return Decision(allowed=False, reason=f"deny: role={str(role.name)} pattern={pat}", role=RoleName(str(role.name)), pattern=pat)
+        for rn in subject.roles:
+            role = policy.roles.get(str(rn))
+            if role is None:
+                continue
+            for pat in role.allow:
+                if permission_matches(pat, perm):
+                    return Decision(allowed=True, reason=f"allow: role={str(role.name)} pattern={pat}", role=RoleName(str(role.name)), pattern=pat)
+        return Decision(allowed=False, reason="deny: default")
+
+
+def evaluate(policy: Policy, subject: Subject, permission: Permission) -> Decision:
+    return PolicyEngine().evaluate(policy, subject, permission)
+
+
+
+===== core/rbac/roles.py =====
+
+"""
+GA Enterprise Core — RBAC Role Model (Immutable)
+------------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.typing (RoleName)
+- core.rbac.grammar
+- core.kernel.invariants
+
+No tenancy import: ENFORCED
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple
+
+from core.typing import RoleName
+from core.rbac.grammar import validate_role_name, validate_permission_pattern
+
+
+@dataclass(frozen=True, slots=True)
+class Role:
+    name: RoleName
+    allow: Tuple[str, ...] = ()
+    deny: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        n = validate_role_name(str(self.name))
+        object.__setattr__(self, "name", RoleName(n))
+        norm_allow = tuple(validate_permission_pattern(p) for p in self.allow)
+        norm_deny = tuple(validate_permission_pattern(p) for p in self.deny)
+        object.__setattr__(self, "allow", norm_allow)
+        object.__setattr__(self, "deny", norm_deny)
+
+
+
+===== core/rbac/__init__.py =====
+
+"""
+GA Enterprise Core — RBAC (Deterministic, Deny-Wins)
+
+LAYER: L3
+
+Purpose:
+- Canonical grammar for roles & permissions
+- Immutable role model
+- Deterministic permission matching (with patterns)
+- Deny-wins policy evaluation
+- No tenancy import (strict boundary)
+"""
+
+from .grammar import (
+    ROLE_NAME_PATTERN,
+    PERMISSION_NAME_PATTERN,
+    PERMISSION_PATTERN_PATTERN,
+    normalize_role_name,
+    normalize_permission_name,
+    validate_role_name,
+    validate_permission_name,
+    validate_permission_pattern,
+)
+from .permissions import permission_matches
+from .roles import Role
+from .policy_engine import (
+    Subject,
+    Policy,
+    Decision,
+    PolicyEngine,
+    evaluate,
+)
+
+__all__ = [
+    "ROLE_NAME_PATTERN",
+    "PERMISSION_NAME_PATTERN",
+    "PERMISSION_PATTERN_PATTERN",
+    "normalize_role_name",
+    "normalize_permission_name",
+    "validate_role_name",
+    "validate_permission_name",
+    "validate_permission_pattern",
+    "permission_matches",
+    "Role",
+    "Subject",
+    "Policy",
+    "Decision",
+    "PolicyEngine",
+    "evaluate",
+]
+
+
+
+===== core/rbac/grammar.py =====
+
+"""
+GA Enterprise Core — RBAC Grammar
+---------------------------------
+
+LAYER: L3
+Dependencies: core.errors (L0)
+Deterministic: YES
+No tenancy import: ENFORCED
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Final
+
+from core.errors import GrammarViolationError
+
+ROLE_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+
+SEG = r"[a-z][a-z0-9]*"
+PERMISSION_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(rf"^{SEG}(?:\.{SEG})*$")
+PERMISSION_PATTERN_PATTERN: Final[re.Pattern[str]] = re.compile(rf"^(?:{SEG}|\*|\*\*)(?:\.(?:{SEG}|\*|\*\*))*$")
+
+
+def normalize_role_name(name: str) -> str:
+    if name is None:
+        raise GrammarViolationError("Role name must not be None")
+    return name.strip().lower()
+
+
+def normalize_permission_name(name: str) -> str:
+    if name is None:
+        raise GrammarViolationError("Permission name must not be None")
+    return name.strip().lower()
+
+
+def validate_role_name(name: str) -> str:
+    n = normalize_role_name(name)
+    if not ROLE_NAME_PATTERN.match(n):
+        raise GrammarViolationError(f"Invalid role name: {name!r}")
+    return n
+
+
+def validate_permission_name(name: str) -> str:
+    n = normalize_permission_name(name)
+    if not PERMISSION_NAME_PATTERN.match(n):
+        raise GrammarViolationError(f"Invalid permission name: {name!r}")
+    return n
+
+
+def validate_permission_pattern(pattern: str) -> str:
+    p = normalize_permission_name(pattern)
+    if not PERMISSION_PATTERN_PATTERN.match(p):
+        raise GrammarViolationError(f"Invalid permission pattern: {pattern!r}")
+    tokens = p.split('.')
+    for i, tok in enumerate(tokens):
+        if tok == "**" and i != len(tokens) - 1:
+            raise GrammarViolationError("The '**' wildcard is only allowed as the last segment")
+    return p
+
+
+
+===== core/rbac/permissions.py =====
+
+"""
+GA Enterprise Core — RBAC Permission Matching
+---------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.rbac.grammar
+- core.kernel.invariants
+- core.errors
+
+Deterministic: YES
+"""
+
+from __future__ import annotations
+
+from core.rbac.grammar import (
+    validate_permission_name,
+    validate_permission_pattern,
+)
+
+
+def permission_matches(pattern: str, permission: str) -> bool:
+    p = validate_permission_pattern(pattern)
+    s = validate_permission_name(permission)
+
+    ptoks = p.split('.')
+    stoks = s.split('.')
+
+    i = j = 0
+    while i < len(ptoks) and j < len(stoks):
+        tok = ptoks[i]
+        if tok == '*':
+            i += 1; j += 1; continue
+        if tok == '**':
+            return True
+        if tok == stoks[j]:
+            i += 1; j += 1; continue
+        return False
+
+    if i == len(ptoks) - 1 and ptoks[-1] == '**':
+        return True
+    return i == len(ptoks) and j == len(stoks)
+
+
+
+===== core/context/accessors.py =====
+
+"""
+GA Enterprise Core — Context Accessors
+--------------------------------------
+
+LAYER: L1
+Dependencies:
+- core.context.request_context
+- core.errors
+
+Purpose:
+- Enforce safe metadata access
+- Prevent silent None usage
+"""
+
+from __future__ import annotations
+
+from core.context.request_context import RequestContext
+from core.typing import (
+    TenantId,
+    UserId,
+    RequestId,
+    CorrelationId,
+)
+from core.errors import InvariantViolationError
+
+
+def require_tenant_id(ctx: RequestContext) -> TenantId:
+    if ctx.tenant_id is None:
+        raise InvariantViolationError("Tenant ID is required")
+    return ctx.tenant_id
+
+
+def require_user_id(ctx: RequestContext) -> UserId:
+    if ctx.user_id is None:
+        raise InvariantViolationError("User ID is required")
+    return ctx.user_id
+
+
+def require_request_id(ctx: RequestContext) -> RequestId:
+    return ctx.request_id
+
+
+def require_correlation_id(ctx: RequestContext) -> CorrelationId:
+    return ctx.correlation_id
+
+
+
+===== core/context/request_context.py =====
+
+"""
+GA Enterprise Core — Immutable Request Context
+----------------------------------------------
+
+LAYER: L1
+Dependencies:
+- core.typing
+- core.kernel.invariants
+- core.errors
+
+Rules:
+- Fully immutable
+- No global state
+- No implicit defaults
+- All values injected
+- No time reads
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+from core.typing import (
+    TenantId,
+    UserId,
+    RequestId,
+    CorrelationId,
+    CausationId,
+    UnixMillis,
+)
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError
+
+
+@dataclass(frozen=True, slots=True)
+class RequestContext:
+    """
+    Immutable request metadata snapshot.
+
+    This object represents a single execution boundary.
+    """
+
+    request_id: RequestId
+    correlation_id: CorrelationId
+    causation_id: CausationId
+    timestamp_ms: UnixMillis
+
+    tenant_id: Optional[TenantId] = None
+    user_id: Optional[UserId] = None
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.request_id, "request_id")
+        assert_not_none(self.correlation_id, "correlation_id")
+        assert_not_none(self.causation_id, "causation_id")
+        assert_not_none(self.timestamp_ms, "timestamp_ms")
+        if self.timestamp_ms < 0:
+            raise InvariantViolationError("timestamp_ms cannot be negative")
+
+    def is_authenticated(self) -> bool:
+        return self.user_id is not None
+
+    def is_multi_tenant(self) -> bool:
+        return self.tenant_id is not None
+
+    def to_dict(self) -> dict[str, str | int | None]:
+        return {
+            "request_id": str(self.request_id),
+            "correlation_id": str(self.correlation_id),
+            "causation_id": str(self.causation_id),
+            "timestamp_ms": int(self.timestamp_ms),
+            "tenant_id": str(self.tenant_id) if self.tenant_id else None,
+            "user_id": str(self.user_id) if self.user_id else None,
+        }
+
+
+
+===== core/context/__init__.py =====
+
+"""
+GA Enterprise Core — Request Context Layer
+
+LAYER: L1
+
+Purpose:
+- Immutable request metadata
+- Safe access helpers
+"""
+
+from .request_context import RequestContext
+from .accessors import (
+    require_tenant_id,
+    require_user_id,
+    require_request_id,
+    require_correlation_id,
+)
+
+__all__ = [
+    "RequestContext",
+    "require_tenant_id",
+    "require_user_id",
+    "require_request_id",
+    "require_correlation_id",
+]
+
+
+
+===== core/identity/__init__.py =====
+
+
+
+===== core/identity/uuid.py =====
+
+"""
+GA Enterprise Core — Deterministic UUID Authority
+-------------------------------------------------
+
+LAYER: L0
+Dependencies: stdlib + core.errors + core.typing
+Randomness: FORBIDDEN
+Time access: FORBIDDEN
+Global state: NONE
+
+Rules:
+- Models must NEVER generate UUIDs.
+- UUIDs must be injected.
+- Default implementation must be deterministic.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import uuid
+from typing import Protocol, runtime_checkable, Final
+
+from core.errors import InvariantViolationError
+from core.typing import (
+    EventId,
+    AggregateId,
+    CorrelationId,
+    CausationId,
+)
+
+
+# ============================================================
+# UUID Provider Protocol
+# ============================================================
+
+@runtime_checkable
+class UUIDProvider(Protocol):
+    """
+    Deterministic UUID provider contract.
+
+    Implementations must be:
+    - Pure
+    - Deterministic
+    - Side-effect free
+    """
+
+    def new_event_id(self) -> EventId: ...
+    def new_aggregate_id(self) -> AggregateId: ...
+    def new_correlation_id(self) -> CorrelationId: ...
+    def new_causation_id(self) -> CausationId: ...
+
+# Compatibility alias
+UuidProvider = UUIDProvider
+
+# ============================================================
+# Deterministic Namespace Provider
+# ============================================================
+
+class DeterministicUUIDProvider:
+    """
+    Deterministic UUIDv5-based provider.
+
+    Requires explicit seed.
+    No randomness.
+    No global counters.
+    """
+
+    _NAMESPACE: Final[uuid.UUID] = uuid.UUID("12345678-1234-5678-1234-567812345678")
+
+    def __init__(self, seed: str) -> None:
+        if not seed:
+            raise InvariantViolationError("UUID seed must be non-empty")
+        self._seed = seed
+
+    def _derive(self, name: str) -> str:
+        full = f"{self._seed}:{name}"
+        digest = hashlib.sha256(full.encode("utf-8")).hexdigest()
+        return str(uuid.uuid5(self._NAMESPACE, digest))
+
+    def new_event_id(self) -> EventId:
+        return EventId(self._derive("event"))
+
+    def new_aggregate_id(self) -> AggregateId:
+        return AggregateId(self._derive("aggregate"))
+
+    def new_correlation_id(self) -> CorrelationId:
+        return CorrelationId(self._derive("correlation"))
+
+    def new_causation_id(self) -> CausationId:
+        return CausationId(self._derive("causation"))
+
+
+__all__ = [
+    "UUIDProvider",
+    "UuidProvider",
+    "DeterministicUUIDProvider",
+]
+
+
+
+===== core/tenancy/tenant_context.py =====
+
+"""
+GA Enterprise Core — Tenant Context (Immutable)
+-----------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.typing
+- core.tenancy.tenant
+- core.kernel.invariants
+
+Rules:
+- Immutable
+- No globals/threadlocals
+- Deterministic
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+from core.typing import TenantId
+from core.tenancy.tenant import Tenant
+from core.kernel.invariants import assert_not_none
+
+
+@dataclass(frozen=True, slots=True)
+class TenantContext:
+    tenant_id: TenantId
+    slug: str
+    name: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.tenant_id, "tenant_id")
+        assert_not_none(self.slug, "slug")
+
+    @staticmethod
+    def from_tenant(t: Tenant) -> "TenantContext":
+        return TenantContext(tenant_id=t.tenant_id, slug=t.slug, name=t.name)
+
+
+
+===== core/tenancy/tenant.py =====
+
+"""
+GA Enterprise Core — Tenant Model (Immutable)
+---------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.typing
+- core.tenancy.grammar
+- core.kernel.invariants
+- core.errors
+
+Rules:
+- Immutable
+- Deterministic slug normalization
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+from core.typing import TenantId
+from core.tenancy.grammar import validate_tenant_slug
+from core.kernel.invariants import assert_not_none
+
+
+@dataclass(frozen=True, slots=True)
+class Tenant:
+    tenant_id: TenantId
+    slug: str
+    name: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.tenant_id, "tenant_id")
+        normalized = validate_tenant_slug(self.slug)
+        object.__setattr__(self, "slug", normalized)
+
+
+
+===== core/tenancy/__init__.py =====
+
+"""
+GA Enterprise Core — Tenancy Layer (L3)
+
+Purpose:
+- SINGLE slug regex authority
+- Immutable Tenant & TenantContext
+- Pure resolver protocol + deterministic in-memory implementation
+
+Rules:
+- No cross-import with RBAC
+- No registry/infrastructure
+- Deterministic & replay-safe
+"""
+
+from .grammar import (
+    TENANT_SLUG_PATTERN,
+    normalize_tenant_slug,
+    is_valid_tenant_slug,
+    validate_tenant_slug,
+)
+from .tenant import Tenant
+from .tenant_context import TenantContext
+from .resolver import (
+    TenantResolver,
+    DeterministicMapTenantResolver,
+    resolve_tenant_required,
+    resolve_tenant_context_by_slug,
+    resolve_tenant_context_by_id,
+)
+
+__all__ = [
+    "TENANT_SLUG_PATTERN",
+    "normalize_tenant_slug",
+    "is_valid_tenant_slug",
+    "validate_tenant_slug",
+    "Tenant",
+    "TenantContext",
+    "TenantResolver",
+    "DeterministicMapTenantResolver",
+    "resolve_tenant_required",
+    "resolve_tenant_context_by_slug",
+    "resolve_tenant_context_by_id",
+]
+
+
+
+===== core/tenancy/grammar.py =====
+
+"""
+GA Enterprise Core — Tenancy Slug Grammar
+-----------------------------------------
+
+LAYER: L3
+Dependencies: core.errors (L0)
+Deterministic: YES
+IO: NONE
+RBAC: FORBIDDEN
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Final
+
+from core.errors import GrammarViolationError
+
+TENANT_SLUG_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+
+
+def normalize_tenant_slug(slug: str) -> str:
+    if slug is None:
+        raise GrammarViolationError("Tenant slug must not be None")
+    return slug.strip().lower()
+
+
+def is_valid_tenant_slug(slug: str) -> bool:
+    s = normalize_tenant_slug(slug)
+    return bool(TENANT_SLUG_PATTERN.match(s))
+
+
+def validate_tenant_slug(slug: str) -> str:
+    s = normalize_tenant_slug(slug)
+    if not TENANT_SLUG_PATTERN.match(s):
+        raise GrammarViolationError(f"Invalid tenant slug: {slug!r}")
+    return s
+
+
+
+===== core/tenancy/resolver.py =====
+
+"""
+GA Enterprise Core — Tenant Resolver (Pure)
+-------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.typing
+- core.tenancy.tenant
+- core.tenancy.grammar
+- core.tenancy.tenant_context
+- core.kernel.invariants
+- core.errors
+
+Rules:
+- No RBAC imports
+- No registry/infrastructure
+- Deterministic resolution (injected data)
+"""
+
+from __future__ import annotations
+
+from typing import Dict, Optional, Protocol, runtime_checkable
+
+from core.typing import TenantId
+from core.tenancy.tenant import Tenant
+from core.tenancy.tenant_context import TenantContext
+from core.tenancy.grammar import validate_tenant_slug
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError, GrammarViolationError
+
+
+@runtime_checkable
+class TenantResolver(Protocol):
+    def resolve_by_id(self, tenant_id: TenantId) -> Optional[Tenant]: ...
+    def resolve_by_slug(self, slug: str) -> Optional[Tenant]: ...
+
+
+class DeterministicMapTenantResolver:
+    def __init__(self, tenants: Dict[str, Tenant] | None = None, *, items: Optional[list[Tenant]] = None) -> None:
+        id_index: Dict[str, Tenant] = {}
+        slug_index: Dict[str, Tenant] = {}
+
+        def _add(t: Tenant):
+            tid = str(t.tenant_id)
+            if tid in id_index:
+                raise InvariantViolationError(f"Duplicate tenant_id {tid}")
+            s = validate_tenant_slug(t.slug)
+            if s in slug_index:
+                raise InvariantViolationError(f"Duplicate tenant slug {s}")
+            id_index[tid] = t
+            slug_index[s] = t
+
+        if tenants is not None:
+            for t in tenants.values():
+                _add(t)
+        if items is not None:
+            for t in items:
+                _add(t)
+
+        self._by_id: Dict[str, Tenant] = dict(id_index)
+        self._by_slug: Dict[str, Tenant] = dict(slug_index)
+
+    def resolve_by_id(self, tenant_id: TenantId) -> Optional[Tenant]:
+        return self._by_id.get(str(tenant_id))
+
+    def resolve_by_slug(self, slug: str) -> Optional[Tenant]:
+        s = validate_tenant_slug(slug)
+        return self._by_slug.get(s)
+
+
+def resolve_tenant_required(resolver: TenantResolver, *, tenant_id: TenantId | None = None, slug: str | None = None) -> Tenant:
+    assert_not_none(resolver, "resolver")
+    if tenant_id is None and slug is None:
+        raise InvariantViolationError("Either tenant_id or slug must be provided")
+    if tenant_id is not None:
+        t = resolver.resolve_by_id(tenant_id)
+        if t is None:
+            raise InvariantViolationError(f"Tenant not found for id={tenant_id!r}")
+        return t
+    try:
+        s = validate_tenant_slug(slug)  # type: ignore[arg-type]
+    except GrammarViolationError as e:
+        raise e
+    t = resolver.resolve_by_slug(s)
+    if t is None:
+        raise InvariantViolationError(f"Tenant not found for slug={s!r}")
+    return t
+
+
+def resolve_tenant_context_by_slug(resolver: TenantResolver, slug: str) -> TenantContext:
+    t = resolve_tenant_required(resolver, slug=slug)
+    return TenantContext.from_tenant(t)
+
+
+def resolve_tenant_context_by_id(resolver: TenantResolver, tenant_id: TenantId) -> TenantContext:
+    t = resolve_tenant_required(resolver, tenant_id=tenant_id)
+    return TenantContext.from_tenant(t)
+
+
+
+===== core/health/registry.py =====
+
+"""
+GA Enterprise Core — Health Registry (In-Memory)
+------------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.typing
+- core.errors
+- core.kernel.invariants
+
+Rules:
+- In-memory only
+- Deterministic ordering (registration order)
+- No IO / No logging / No threads / No async
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Callable, Dict, Mapping, Any, Optional, Protocol, runtime_checkable, Tuple
+
+from core.typing import UnixMillis
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError
+
+
+class HealthStatus(Enum):
+    OK = auto()
+    WARN = auto()
+    FAIL = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class HealthCheckResult:
+    name: str
+    status: HealthStatus
+    timestamp_ms: UnixMillis
+    details: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.name, "name")
+        assert_not_none(self.status, "status")
+        assert_not_none(self.timestamp_ms, "timestamp_ms")
+        if self.timestamp_ms < 0:
+            raise InvariantViolationError("timestamp_ms cannot be negative")
+
+
+@runtime_checkable
+class HealthCheck(Protocol):
+    def __call__(self, now_ms: UnixMillis) -> HealthCheckResult: ...
+
+
+class HealthRegistry:
+    def __init__(self) -> None:
+        self._checks: Dict[str, HealthCheck] = {}
+
+    def register(self, name: str, check: HealthCheck) -> None:
+        assert_not_none(name, "name")
+        assert_not_none(check, "check")
+        if name in self._checks:
+            raise InvariantViolationError(f"Health check {name!r} already registered")
+        self._checks[name] = check
+
+    def unregister(self, name: str) -> None:
+        assert_not_none(name, "name")
+        if name not in self._checks:
+            raise InvariantViolationError(f"Health check {name!r} not found")
+        del self._checks[name]
+
+    def get(self, name: str) -> Optional[HealthCheck]:
+        return self._checks.get(name)
+
+    def names(self) -> Tuple[str, ...]:
+        return tuple(self._checks.keys())
+
+    def run_all(self, now_ms: UnixMillis) -> Tuple[HealthCheckResult, ...]:
+        if now_ms < 0:
+            raise InvariantViolationError("now_ms cannot be negative")
+        results = []
+        for name in self._checks.keys():
+            check = self._checks[name]
+            res = check(now_ms)
+            if res.name != name:
+                raise InvariantViolationError(
+                    f"Health check result name {res.name!r} does not match registered name {name!r}"
+                )
+            results.append(res)
+        return tuple(results)
+
+
+
+===== core/health/diagnostics.py =====
+
+"""
+GA Enterprise Core — Health Diagnostics (Deterministic)
+-------------------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.health.registry
+- core.typing
+- core.kernel.invariants
+
+Rules:
+- No IO / No logging / No threads / No async
+- Pure summarization; timestamps injected by caller
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Mapping, Dict, Tuple
+
+from core.health.registry import HealthStatus, HealthCheckResult, HealthRegistry
+from core.typing import UnixMillis
+from core.kernel.invariants import assert_not_none
+
+
+_STATUS_RANK = {
+    HealthStatus.OK: 0,
+    HealthStatus.WARN: 1,
+    HealthStatus.FAIL: 2,
+}
+
+
+def summarize_status(results: Tuple[HealthCheckResult, ...]) -> HealthStatus:
+    worst = HealthStatus.OK
+    for r in results:
+        if _STATUS_RANK[r.status] > _STATUS_RANK[worst]:
+            worst = r.status
+            if worst is HealthStatus.FAIL:
+                break
+    return worst
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticReport:
+    generated_ms: UnixMillis
+    overall: HealthStatus
+    results: Tuple[HealthCheckResult, ...]
+    counts: Dict[str, int]
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "generated_ms": int(self.generated_ms),
+            "overall": self.overall.name,
+            "counts": dict(self.counts),
+            "results": [
+                {
+                    "name": r.name,
+                    "status": r.status.name,
+                    "timestamp_ms": int(r.timestamp_ms),
+                    "details": dict(r.details),
+                }
+                for r in self.results
+            ],
+        }
+
+
+def run_diagnostics(registry: HealthRegistry, now_ms: UnixMillis) -> DiagnosticReport:
+    assert_not_none(registry, "registry")
+    results = registry.run_all(now_ms)
+    overall = summarize_status(results)
+    counts: Dict[str, int] = {"OK": 0, "WARN": 0, "FAIL": 0}
+    for r in results:
+        counts[r.status.name] += 1
+    return DiagnosticReport(generated_ms=now_ms, overall=overall, results=results, counts=counts)
+
+
+
+===== core/health/__init__.py =====
+
+"""
+GA Enterprise Core — Health (In-Memory, Deterministic)
+
+LAYER: L3
+
+Purpose:
+- In-memory health registry
+- Deterministic diagnostics report
+- No IO / No threads / No async / No logging
+
+Notes:
+- Timestamps are injected by the caller (replay-safe).
+- Deterministic ordering (registration order).
+"""
+
+from .registry import (
+    HealthStatus,
+    HealthCheckResult,
+    HealthCheck,
+    HealthRegistry,
+)
+from .diagnostics import (
+    DiagnosticReport,
+    summarize_status,
+    run_diagnostics,
+)
+
+__all__ = [
+    "HealthStatus", "HealthCheckResult", "HealthCheck", "HealthRegistry",
+    "DiagnosticReport", "summarize_status", "run_diagnostics",
+]
+
+
+
+===== core/__init__.py =====
+
+
+
+===== core/saga/__init__.py =====
+
+"""
+GA Enterprise Core — Saga (Deterministic Coordination)
+
+LAYER: L2
+
+Purpose:
+- Immutable saga state model
+- Pure state transitions
+- Deterministic coordination (no timers/scheduling)
+"""
+
+from .state import (
+    SagaStatus,
+    StepStatus,
+    SagaStep,
+    SagaSnapshot,
+    new_saga,
+)
+
+from .manager import (
+    SagaSignal,
+    StartSaga,
+    StepSucceeded,
+    StepFailed,
+    BeginCompensation,
+    StepCompensated,
+    AbortSaga,
+    SagaEffects,
+    SagaManager,
+)
+
+__all__ = [
+    "SagaStatus", "StepStatus", "SagaStep", "SagaSnapshot", "new_saga",
+    "SagaSignal", "StartSaga", "StepSucceeded", "StepFailed", "BeginCompensation", "StepCompensated", "AbortSaga",
+    "SagaEffects", "SagaManager",
+]
+
+
+
+===== core/saga/manager.py =====
+
+"""
+GA Enterprise Core — Saga Manager (Pure Coordinator)
+----------------------------------------------------
+
+LAYER: L2
+Dependencies:
+- core.saga.state
+- core.typing
+- core.kernel.invariants
+- core.errors
+
+Rules:
+- Pure state machine (no IO/threads/async)
+- No timers or scheduling (time injected via now_ms)
+- Deterministic effects (pure data only)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Mapping, Any, Tuple, List
+
+from core.saga.state import (
+    SagaSnapshot,
+    SagaStatus,
+)
+from core.typing import UnixMillis
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError
+
+
+class SagaSignal:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class StartSaga(SagaSignal):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class StepSucceeded(SagaSignal):
+    step_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class StepFailed(SagaSignal):
+    step_name: str
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class BeginCompensation(SagaSignal):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class StepCompensated(SagaSignal):
+    step_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class AbortSaga(SagaSignal):
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class SagaEffects:
+    emitted: Tuple[Mapping[str, Any], ...] = ()
+
+    @staticmethod
+    def emit(event_type: str, payload: Mapping[str, Any]) -> "SagaEffects":
+        return SagaEffects(emitted=({"type": event_type, "payload": dict(payload)},))
+
+    @staticmethod
+    def combine(*effects: "SagaEffects") -> "SagaEffects":
+        acc: List[Mapping[str, Any]] = []
+        for e in effects:
+            acc.extend(e.emitted)
+        return SagaEffects(emitted=tuple(acc))
+
+
+class SagaManager:
+    def apply(self, state: SagaSnapshot, signal: SagaSignal, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+        assert_not_none(state, "state")
+        assert_not_none(signal, "signal")
+        assert_not_none(now_ms, "now_ms")
+        if isinstance(signal, StartSaga):
+            return self._start(state, now_ms)
+        if isinstance(signal, StepSucceeded):
+            return self._step_succeeded(state, signal.step_name, now_ms)
+        if isinstance(signal, StepFailed):
+            return self._step_failed(state, signal.step_name, signal.error, now_ms)
+        if isinstance(signal, BeginCompensation):
+            return self._begin_compensation(state, now_ms)
+        if isinstance(signal, StepCompensated):
+            return self._step_compensated(state, signal.step_name, now_ms)
+        if isinstance(signal, AbortSaga):
+            return self._abort(state, signal.reason, now_ms)
+        raise InvariantViolationError(f"Unknown signal: {type(signal).__name__}")
+
+    def _start(self, s: SagaSnapshot, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+        ns = s.start(now_ms)
+        eff = SagaEffects.emit("saga.started", {"saga_id": str(s.saga_id), "ts": int(now_ms)})
+        return ns, eff
+
+    def _step_succeeded(self, s: SagaSnapshot, name: str, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+        ns = s.step_done(name, now_ms)
+        evt = SagaEffects.emit("saga.step.succeeded", {"saga_id": str(s.saga_id), "step": name, "ts": int(now_ms)})
+        if ns.status == SagaStatus.COMPLETED and s.status != SagaStatus.COMPLETED:
+            done = SagaEffects.emit("saga.completed", {"saga_id": str(s.saga_id), "ts": int(now_ms)})
+            return ns, SagaEffects.combine(evt, done)
+        return ns, evt
+
+    def _step_failed(self, s: SagaSnapshot, name: str, error: str, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+        ns = s.step_failed(name, error, now_ms)
+        evt = SagaEffects.emit("saga.step.failed", {"saga_id": str(s.saga_id), "step": name, "error": error, "ts": int(now_ms)})
+        return ns, evt
+
+    def _begin_compensation(self, s: SagaSnapshot, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+        ns = s.begin_compensation(now_ms)
+        evt = SagaEffects.emit("saga.compensation.started", {"saga_id": str(s.saga_id), "ts": int(now_ms)})
+        return ns, evt
+
+    def _step_compensated(self, s: SagaSnapshot, name: str, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+        ns = s.step_compensated(name, now_ms)
+        evt = SagaEffects.emit("saga.step.compensated", {"saga_id": str(s.saga_id), "step": name, "ts": int(now_ms)})
+        if ns.status == SagaStatus.COMPLETED and s.status != SagaStatus.COMPLETED:
+            done = SagaEffects.emit("saga.completed", {"saga_id": str(s.saga_id), "ts": int(now_ms)})
+            return ns, SagaEffects.combine(evt, done)
+        return ns, evt
+
+    def _abort(self, s: SagaSnapshot, reason: str, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+        ns = s._with(status=SagaStatus.FAILED, updated_ms=now_ms, error=reason)
+        evt = SagaEffects.emit("saga.aborted", {"saga_id": str(s.saga_id), "reason": reason, "ts": int(now_ms)})
+        return ns, evt
+
+
+
+===== core/saga/state.py =====
+
+"""
+GA Enterprise Core — Saga State (Immutable, Pure)
+-------------------------------------------------
+
+LAYER: L2
+Dependencies:
+- core.typing
+- core.kernel.invariants
+- core.errors
+
+Rules:
+- Immutable dataclasses
+- Pure transitions (return new instances)
+- No timers, no scheduling (time injected)
+- No IO/logging/threads
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Tuple, Optional, Mapping, Any
+
+from core.typing import AggregateId, Version, UnixMillis, CorrelationId, CausationId
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError
+
+
+class StepStatus(Enum):
+    PENDING = auto()
+    DONE = auto()
+    FAILED = auto()
+    COMPENSATING = auto()
+    COMPENSATED = auto()
+    SKIPPED = auto()
+
+
+class SagaStatus(Enum):
+    INIT = auto()
+    RUNNING = auto()
+    FAILED = auto()
+    COMPENSATING = auto()
+    COMPLETED = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class SagaStep:
+    name: str
+    status: StepStatus = StepStatus.PENDING
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise InvariantViolationError("SagaStep.name must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class SagaSnapshot:
+    saga_id: AggregateId
+    status: SagaStatus
+    version: Version
+    steps: Tuple[SagaStep, ...]
+    started_ms: UnixMillis
+    updated_ms: UnixMillis
+    correlation_id: CorrelationId
+    causation_id: CausationId
+    error: Optional[str] = None
+    context: Optional[Mapping[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.saga_id, "saga_id")
+        assert_not_none(self.status, "status")
+        assert_not_none(self.version, "version")
+        assert_not_none(self.steps, "steps")
+        assert_not_none(self.started_ms, "started_ms")
+        assert_not_none(self.updated_ms, "updated_ms")
+        assert_not_none(self.correlation_id, "correlation_id")
+        assert_not_none(self.causation_id, "causation_id")
+        if int(self.version) < 0:
+            raise InvariantViolationError("version cannot be negative")
+        if self.started_ms < 0 or self.updated_ms < 0:
+            raise InvariantViolationError("timestamps cannot be negative")
+        if self.updated_ms < self.started_ms:
+            raise InvariantViolationError("updated_ms cannot be earlier than started_ms")
+
+    def _with(
+        self,
+        *,
+        status: Optional[SagaStatus] = None,
+        steps: Optional[Tuple[SagaStep, ...]] = None,
+        updated_ms: Optional[UnixMillis] = None,
+        error: Optional[Optional[str]] = None,
+        context: Optional[Optional[Mapping[str, Any]]] = None,
+        bump_version: bool = True,
+    ) -> "SagaSnapshot":
+        v = Version(int(self.version) + 1) if bump_version else self.version
+        return SagaSnapshot(
+            saga_id=self.saga_id,
+            status=status if status is not None else self.status,
+            version=v,
+            steps=steps if steps is not None else self.steps,
+            started_ms=self.started_ms,
+            updated_ms=updated_ms if updated_ms is not None else self.updated_ms,
+            correlation_id=self.correlation_id,
+            causation_id=self.causation_id,
+            error=(error if error is not None else self.error),
+            context=(context if context is not None else self.context),
+        )
+
+    def _replace_step(self, name: str, new_status: StepStatus) -> Tuple[SagaStep, ...]:
+        found = False
+        new_steps = []
+        for s in self.steps:
+            if s.name == name:
+                new_steps.append(SagaStep(name=s.name, status=new_status))
+                found = True
+            else:
+                new_steps.append(s)
+        if not found:
+            raise InvariantViolationError(f"Step {name!r} not found in saga")
+        return tuple(new_steps)
+
+    def start(self, now_ms: UnixMillis) -> "SagaSnapshot":
+        if self.status != SagaStatus.INIT:
+            raise InvariantViolationError("Saga can only start from INIT")
+        return self._with(status=SagaStatus.RUNNING, updated_ms=now_ms)
+
+    def step_done(self, name: str, now_ms: UnixMillis) -> "SagaSnapshot":
+        if self.status != SagaStatus.RUNNING:
+            raise InvariantViolationError("step_done only allowed in RUNNING")
+        steps = self._replace_step(name, StepStatus.DONE)
+        new_status = SagaStatus.COMPLETED if all(s.status == StepStatus.DONE for s in steps) else SagaStatus.RUNNING
+        return self._with(status=new_status, steps=steps, updated_ms=now_ms)
+
+    def step_failed(self, name: str, error: str, now_ms: UnixMillis) -> "SagaSnapshot":
+        if self.status not in (SagaStatus.RUNNING, SagaStatus.COMPENSATING):
+            raise InvariantViolationError("step_failed allowed only in RUNNING/COMPENSATING")
+        steps = self._replace_step(name, StepStatus.FAILED)
+        return self._with(status=SagaStatus.FAILED, steps=steps, updated_ms=now_ms, error=error)
+
+    def begin_compensation(self, now_ms: UnixMillis) -> "SagaSnapshot":
+        if self.status != SagaStatus.FAILED:
+            raise InvariantViolationError("begin_compensation only allowed from FAILED")
+        return self._with(status=SagaStatus.COMPENSATING, updated_ms=now_ms)
+
+    def mark_compensating(self, name: str, now_ms: UnixMillis) -> "SagaSnapshot":
+        if self.status != SagaStatus.COMPENSATING:
+            raise InvariantViolationError("mark_compensating only allowed in COMPENSATING")
+        steps = self._replace_step(name, StepStatus.COMPENSATING)
+        return self._with(steps=steps, updated_ms=now_ms)
+
+    def step_compensated(self, name: str, now_ms: UnixMillis) -> "SagaSnapshot":
+        if self.status != SagaStatus.COMPENSATING:
+            raise InvariantViolationError("step_compensated only allowed in COMPENSATING")
+        steps = self._replace_step(name, StepStatus.COMPENSATED)
+        new_status = SagaStatus.COMPLETED if all(s.status in (StepStatus.COMPENSATED, StepStatus.PENDING, StepStatus.SKIPPED) for s in steps) else SagaStatus.COMPENSATING
+        return self._with(status=new_status, steps=steps, updated_ms=now_ms)
+
+    def with_context(self, ctx: Mapping[str, Any], now_ms: UnixMillis) -> "SagaSnapshot":
+        return self._with(context=ctx, updated_ms=now_ms)
+
+    def with_correlation(self, correlation_id: CorrelationId, causation_id: CausationId, now_ms: UnixMillis) -> "SagaSnapshot":
+        return SagaSnapshot(
+            saga_id=self.saga_id,
+            status=self.status,
+            version=Version(int(self.version) + 1),
+            steps=self.steps,
+            started_ms=self.started_ms,
+            updated_ms=now_ms,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            error=self.error,
+            context=self.context,
+        )
+
+
+def new_saga(
+    *,
+    saga_id: AggregateId,
+    steps: Tuple[str, ...],
+    started_ms: UnixMillis,
+    correlation_id: CorrelationId,
+    causation_id: CausationId,
+    context: Optional[Mapping[str, Any]] = None,
+) -> SagaSnapshot:
+    assert_not_none(saga_id, "saga_id")
+    if started_ms < 0:
+        raise InvariantViolationError("started_ms cannot be negative")
+    step_objs = tuple(SagaStep(name=s) for s in steps)
+    return SagaSnapshot(
+        saga_id=saga_id,
+        status=SagaStatus.INIT,
+        version=Version(0),
+        steps=step_objs,
+        started_ms=started_ms,
+        updated_ms=started_ms,
+        correlation_id=correlation_id,
+        causation_id=causation_id,
+        error=None,
+        context=context,
+    )
+
+
+
+===== core/time/clock.py =====
+
+"""
+GA Enterprise Core — Clock Authority
+-------------------------------------
+
+LAYER: L0
+Dependencies: stdlib + core.typing + core.errors
+System time access: FORBIDDEN inside models
+Deterministic: YES
+
+Rules:
+- Time must be injected.
+- No datetime.now() in models.
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Protocol, runtime_checkable
+
+from core.typing import UnixMillis
+from core.errors import InvariantViolationError
+
+
+@runtime_checkable
+class Clock(Protocol):
+    """
+    Deterministic clock contract.
+    """
+
+    def now_ms(self) -> UnixMillis: ...
+
+
+class SystemClock:
+    """
+    Real system clock.
+
+    NOTE:
+    - May only be instantiated at infrastructure boundary.
+    - Never inside models.
+    """
+
+    def now_ms(self) -> UnixMillis:
+        return UnixMillis(int(time.time() * 1000))
+
+
+class FixedClock:
+    """
+    Always returns the same timestamp.
+    Fully deterministic.
+    """
+
+    def __init__(self, fixed_time: UnixMillis) -> None:
+        if fixed_time < 0:
+            raise InvariantViolationError("Time cannot be negative")
+        self._fixed_time = fixed_time
+
+    def now_ms(self) -> UnixMillis:
+        return self._fixed_time
+
+
+__all__ = [
+    "Clock",
+    "SystemClock",
+    "FixedClock",
+]
+
+
+
+===== core/time/__init__.py =====
+
+
+
+===== core/time/hlc.py =====
+
+"""
+GA Enterprise Core — Hybrid Logical Clock (HLC)
+-----------------------------------------------
+
+LAYER: L0
+Dependencies: core.typing + core.errors
+System time access: NONE
+Threading: NONE
+IO: NONE
+
+Purpose:
+- Provide causal ordering
+- Combine physical time + logical counter
+- Deterministic state transitions
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from core.typing import UnixMillis
+from core.errors import InvariantViolationError
+
+
+@dataclass(frozen=True, slots=True)
+class HLC:
+    """
+    Hybrid Logical Clock state.
+
+    physical: Unix milliseconds
+    logical: logical counter
+    """
+
+    physical: UnixMillis
+    logical: int
+
+    def __post_init__(self) -> None:
+        if self.physical < 0:
+            raise InvariantViolationError("Physical time cannot be negative")
+        if self.logical < 0:
+            raise InvariantViolationError("Logical counter cannot be negative")
+
+    def tick(self, now: UnixMillis) -> "HLC":
+        if now < 0:
+            raise InvariantViolationError("Time cannot be negative")
+        if now > self.physical:
+            return HLC(now, 0)
+        return HLC(self.physical, self.logical + 1)
+
+    def merge(self, remote: "HLC", now: UnixMillis) -> "HLC":
+        if now < 0:
+            raise InvariantViolationError("Time cannot be negative")
+        max_physical = max(self.physical, remote.physical, now)
+        if max_physical == self.physical == remote.physical:
+            return HLC(max_physical, max(self.logical, remote.logical) + 1)
+        if max_physical == self.physical:
+            return HLC(max_physical, self.logical + 1)
+        if max_physical == remote.physical:
+            return HLC(max_physical, remote.logical + 1)
+        return HLC(max_physical, 0)
+
+
+__all__ = ["HLC"]
+
+
+
+===== core/typing/primitives.py =====
+
+"""
+GA Enterprise Core — Deterministic Typing Primitives
+----------------------------------------------------
+
+LAYER: L0
+Dependencies: stdlib only
+Infrastructure: NONE
+Deterministic: YES
+
+Rules:
+- No runtime mutation helpers
+- No reflection
+- No dynamic type factories
+- Protocol-first design
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import (
+    Any,
+    Final,
+    Mapping,
+    NewType,
+    Protocol,
+    TypeVar,
+    runtime_checkable,
+)
+
+# ============================================================
+# Strong Domain Types
+# ============================================================
+
+TenantId = NewType("TenantId", str)
+UserId = NewType("UserId", str)
+RequestId = NewType("RequestId", str)
+EventId = NewType("EventId", str)
+CorrelationId = NewType("CorrelationId", str)
+CausationId = NewType("CausationId", str)
+AggregateId = NewType("AggregateId", str)
+Permission = NewType("Permission", str)
+RoleName = NewType("RoleName", str)
+
+# ============================================================
+# Time & Version Types
+# ============================================================
+
+UnixMillis = NewType("UnixMillis", int)
+Version = NewType("Version", int)
+
+# ============================================================
+# Generic Type Variables
+# ============================================================
+
+T = TypeVar("T")
+K = TypeVar("K")
+V = TypeVar("V")
+R = TypeVar("R")
+
+# Optional: ID type variable for Identifiable
+ID_co = TypeVar("ID_co", covariant=True)
+
+# ============================================================
+# Protocol Foundations
+# ============================================================
+
+@runtime_checkable
+class Identifiable(Protocol[ID_co]):
+    """
+    Protocol for entities that expose an ID.
+    Keeps the field name stable for ergonomics in the core.
+    """
+    id: ID_co
+
+
+@runtime_checkable
+class Versioned(Protocol):
+    """
+    Protocol for version-controlled entities.
+    """
+    version: Version
+
+
+@runtime_checkable
+class Serializable(Protocol):
+    """
+    Deterministic serialization contract.
+
+    Implementations should return a JSON-serializable mapping.
+    The caller may normalize keys and order when hashing (e.g., via a stable dumper).
+    """
+    def to_dict(self) -> Mapping[str, Any]: ...
+
+# ============================================================
+# Frozen Model Base
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class FrozenModel:
+    """
+    Base class for deterministic immutable models.
+
+    Enforces:
+    - Immutability (frozen dataclass)
+    - Slot usage (predictable memory layout)
+    - No dynamic attributes
+
+    Notes:
+    - Subclasses should avoid storing non-deterministic values at init time.
+    - Prefer pure data + explicit injected dependencies in higher layers.
+    """
+    pass
+
+# ============================================================
+# Deterministic Constants
+# ============================================================
+
+TRUE: Final[bool] = True
+FALSE: Final[bool] = False
+
+
+
+===== core/typing/__init__.py =====
+
+from .primitives import (
+    TenantId, UserId, RequestId, EventId, CorrelationId, CausationId,
+    AggregateId, Permission, RoleName,
+    UnixMillis, Version,
+    T, K, V, R, ID_co,
+    Identifiable, Versioned, Serializable,
+    FrozenModel,
+    TRUE, FALSE,
+)
+
+__all__ = [
+    "TenantId", "UserId", "RequestId", "EventId", "CorrelationId", "CausationId",
+    "AggregateId", "Permission", "RoleName",
+    "UnixMillis", "Version",
+    "T", "K", "V", "R", "ID_co",
+    "Identifiable", "Versioned", "Serializable",
+    "FrozenModel",
+    "TRUE", "FALSE",
+]
+
+
+
+===== core/audit/storage_protocol.py =====
+
+"""
+GA Enterprise Core — Audit Store Protocol
+-----------------------------------------
+
+LAYER: L2
+Dependencies: core.audit.chain
+IO: NONE (protocol only)
+"""
+
+from __future__ import annotations
+
+from typing import List, Optional, Protocol, runtime_checkable
+
+from core.audit.chain import ChainLink
+
+
+@runtime_checkable
+class AuditStore(Protocol):
+    def append_link(self, link: ChainLink) -> None: ...
+    def last_link(self) -> Optional[ChainLink]: ...
+    def get_range(self, start_index: int, limit: int) -> List[ChainLink]: ...
+
+
+
+===== core/audit/merkle.py =====
+
+"""
+GA Enterprise Core — Merkle Root
+--------------------------------
+
+LAYER: L2
+Dependencies: core.audit.chain (ZERO_HASH validation)
+IO: NONE
+Randomness: NONE
+"""
+
+from __future__ import annotations
+
+import hashlib
+from typing import List
+
+from core.audit.chain import ZERO_HASH
+from core.errors import InvariantViolationError
+
+
+def _hex_to_bytes(h: str) -> bytes:
+    if not isinstance(h, str) or len(h) != 64:
+        raise InvariantViolationError("hash must be a 64-hex string")
+    try:
+        return bytes.fromhex(h)
+    except ValueError:
+        raise InvariantViolationError("hash is not valid hex")
+
+
+def _pair_hash(left_hex: str, right_hex: str) -> str:
+    left = _hex_to_bytes(left_hex)
+    right = _hex_to_bytes(right_hex)
+    return hashlib.sha256(left + right).hexdigest()
+
+
+def merkle_root(hashes: List[str]) -> str:
+    if not hashes:
+        return ZERO_HASH
+    for h in hashes:
+        _hex_to_bytes(h)
+    layer = list(hashes)
+    while len(layer) > 1:
+        next_layer: List[str] = []
+        i = 0
+        n = len(layer)
+        while i < n:
+            left = layer[i]
+            right = layer[i + 1] if (i + 1) < n else layer[i]
+            next_layer.append(_pair_hash(left, right))
+            i += 2
+        layer = next_layer
+    return layer[0]
+
+
+
+===== core/audit/chain.py =====
+
+"""
+GA Enterprise Core — Audit Chain
+--------------------------------
+
+LAYER: L2
+Dependencies:
+- core.kernel.invariants
+- core.errors
+
+Rules:
+- Immutable chain links
+- Pure hashing
+- No IO
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from typing import Optional
+
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError
+
+ZERO_HASH: str = "0" * 64
+
+
+def _hex_to_bytes(h: str) -> bytes:
+    if not isinstance(h, str) or len(h) != 64:
+        raise InvariantViolationError("hash must be a 64-hex string")
+    try:
+        return bytes.fromhex(h)
+    except ValueError:
+        raise InvariantViolationError("hash is not valid hex")
+
+
+@dataclass(frozen=True, slots=True)
+class ChainLink:
+    index: int
+    prev_hash: str
+    record_hash: str
+    chain_hash: str
+
+    def __post_init__(self) -> None:
+        if self.index < 0:
+            raise InvariantViolationError("index cannot be negative")
+        _hex_to_bytes(self.prev_hash)
+        _hex_to_bytes(self.record_hash)
+        _hex_to_bytes(self.chain_hash)
+
+
+def make_chain_link(prev: Optional["ChainLink"], record_hash: str) -> "ChainLink":
+    assert_not_none(record_hash, "record_hash")
+    _hex_to_bytes(record_hash)
+    if prev is None:
+        prev_hash = ZERO_HASH
+        index = 0
+    else:
+        prev_hash = prev.chain_hash
+        index = prev.index + 1
+    chain_hash = hashlib.sha256(_hex_to_bytes(prev_hash) + _hex_to_bytes(record_hash)).hexdigest()
+    return ChainLink(index=index, prev_hash=prev_hash, record_hash=record_hash, chain_hash=chain_hash)
+
+
+
+===== core/audit/audit_writer.py =====
+
+"""
+GA Enterprise Core — Audit Writer
+---------------------------------
+
+LAYER: L2
+Dependencies:
+- core.audit.audit_record
+- core.audit.chain
+- core.audit.storage_protocol
+- core.kernel.invariants
+
+Rules:
+- No IO
+- Deterministic hashing
+- Pure state transitions
+"""
+
+from __future__ import annotations
+
+from core.audit.audit_record import AuditRecord
+from core.audit.chain import ChainLink, make_chain_link
+from core.audit.storage_protocol import AuditStore
+from core.kernel.invariants import assert_not_none
+
+
+def write_audit_entry(store: AuditStore, record: AuditRecord) -> ChainLink:
+    assert_not_none(store, "store")
+    assert_not_none(record, "record")
+    prev = store.last_link()
+    link = make_chain_link(prev, record.content_hash)
+    store.append_link(link)
+    return link
+
+
+
+===== core/audit/audit_record.py =====
+
+"""
+GA Enterprise Core — Immutable Audit Record
+-------------------------------------------
+
+LAYER: L2
+Dependencies:
+- core.typing
+- core.kernel.invariants
+- core.errors
+
+Rules:
+- Immutable
+- Deterministic content hashing
+- No IO, no randomness, no time reads here (timestamp injected)
+"""
+
+from __future__ import annotations
+
+import json
+import hashlib
+from dataclasses import dataclass
+from typing import Any, Mapping, Optional
+
+from core.typing import UnixMillis, TenantId, EventId
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError
+
+
+@dataclass(frozen=True, slots=True)
+class AuditRecord:
+    ts: UnixMillis
+    category: str
+    action: str
+    tenant_id: Optional[TenantId]
+    principal: Optional[str]
+    event_id: Optional[EventId]
+    data: Mapping[str, Any]
+    content_hash: str
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.ts, "ts")
+        assert_not_none(self.category, "category")
+        assert_not_none(self.action, "action")
+        assert_not_none(self.data, "data")
+        assert_not_none(self.content_hash, "content_hash")
+        if self.ts < 0:
+            raise InvariantViolationError("ts cannot be negative")
+        if not isinstance(self.content_hash, str) or len(self.content_hash) != 64:
+            raise InvariantViolationError("content_hash must be a 64-hex string")
+
+    @staticmethod
+    def create(
+        *,
+        ts: UnixMillis,
+        category: str,
+        action: str,
+        tenant_id: Optional[TenantId],
+        principal: Optional[str],
+        event_id: Optional[EventId],
+        data: Mapping[str, Any],
+    ) -> "AuditRecord":
+        if ts is None or category is None or action is None or data is None:
+            raise InvariantViolationError("ts, category, action, and data are required")
+        canonical = {
+            "ts": int(ts),
+            "category": str(category),
+            "action": str(action),
+            "tenant_id": (str(tenant_id) if tenant_id is not None else None),
+            "principal": (str(principal) if principal is not None else None),
+            "event_id": (str(event_id) if event_id is not None else None),
+            "data": data,
+        }
+        encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        return AuditRecord(
+            ts=ts, category=category, action=action,
+            tenant_id=tenant_id, principal=principal, event_id=event_id,
+            data=data, content_hash=digest,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ts": int(self.ts),
+            "category": self.category,
+            "action": self.action,
+            "tenant_id": (str(self.tenant_id) if self.tenant_id is not None else None),
+            "principal": (str(self.principal) if self.principal is not None else None),
+            "event_id": (str(self.event_id) if self.event_id is not None else None),
+            "data": dict(self.data),
+            "content_hash": self.content_hash,
+        }
+
+
+
+===== core/audit/__init__.py =====
+
+"""
+GA Enterprise Core — Audit Spine (Deterministic)
+-----------------------------------------------
+
+LAYER: L2
+
+Purpose:
+- Immutable audit records
+- Deterministic content hashing
+- Chain hashing (prev + record)
+- Merkle root calculator
+- Store protocol (no IO)
+- Pure audit writer (no background behavior)
+"""
+
+from .audit_record import AuditRecord
+from .chain import ChainLink, ZERO_HASH, make_chain_link
+from .merkle import merkle_root
+from .storage_protocol import AuditStore
+from .audit_writer import write_audit_entry
+
+__all__ = [
+    "AuditRecord",
+    "ChainLink", "ZERO_HASH", "make_chain_link",
+    "merkle_root",
+    "AuditStore",
+    "write_audit_entry",
+]
+
+
+
+===== core/execution/transaction.py =====
+
+"""
+GA Enterprise Core — Logical Transaction Boundary
+-------------------------------------------------
+
+LAYER: L1
+Dependencies:
+- core.execution.execution_context
+- core.kernel.invariants
+
+Rules:
+- No DB logic
+- No commit/rollback
+- Pure scope wrapper
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from core.execution.execution_context import ExecutionContext
+from core.kernel.invariants import assert_not_none
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionBoundary:
+    """
+    Logical transaction boundary.
+
+    Responsible only for:
+    - Entering strict write mode
+    - Returning new execution context
+    """
+
+    execution_context: ExecutionContext
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.execution_context, "execution_context")
+
+    def begin(self) -> ExecutionContext:
+        return self.execution_context.with_write_mode()
+
+
+
+===== core/execution/__init__.py =====
+
+"""
+GA Enterprise Core — Execution Layer
+
+LAYER: L1
+
+Purpose:
+- Deterministic execution boundary
+- Strict write enforcement
+- Logical transaction model
+"""
+
+from .execution_context import ExecutionContext
+from .strict_write import StrictWriteMode
+from .transaction import TransactionBoundary
+
+__all__ = [
+    "ExecutionContext",
+    "StrictWriteMode",
+    "TransactionBoundary",
+]
+
+
+
+===== core/execution/strict_write.py =====
+
+"""
+GA Enterprise Core — Strict Write Enforcement
+---------------------------------------------
+
+LAYER: L1
+Dependencies:
+- core.execution.execution_context
+- core.errors
+
+Purpose:
+- Prevent write operations outside explicit write mode.
+"""
+
+from __future__ import annotations
+
+from core.execution.execution_context import ExecutionContext
+from core.errors import StrictWriteViolationError
+
+
+class StrictWriteMode:
+    """
+    Write enforcement authority.
+    """
+
+    @staticmethod
+    def require_write(ctx: ExecutionContext) -> None:
+        if not ctx.write_mode:
+            raise StrictWriteViolationError()
+
+
+
+===== core/execution/execution_context.py =====
+
+"""
+GA Enterprise Core — Execution Context
+--------------------------------------
+
+LAYER: L1
+Dependencies:
+- core.context
+- core.identity.uuid
+- core.time.clock
+- core.kernel.invariants
+- core.errors
+
+Rules:
+- Immutable
+- No hidden state
+- No global registry
+- No implicit time reads
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from core.context.request_context import RequestContext
+from core.identity.uuid import UUIDProvider
+from core.time.clock import Clock
+from core.kernel.invariants import assert_not_none
+from core.typing import UnixMillis
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionContext:
+    """
+    Immutable execution boundary.
+
+    Represents:
+    - Request metadata
+    - Deterministic clock
+    - Deterministic UUID provider
+    - Write-mode state (logical only)
+    """
+
+    request_context: RequestContext
+    clock: Clock
+    uuid_provider: UUIDProvider
+    write_mode: bool = False
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.request_context, "request_context")
+        assert_not_none(self.clock, "clock")
+        assert_not_none(self.uuid_provider, "uuid_provider")
+
+    def now(self) -> UnixMillis:
+        return self.clock.now_ms()
+
+    def with_write_mode(self) -> "ExecutionContext":
+        from core.errors import InvariantViolationError
+        if self.write_mode:
+            raise InvariantViolationError("Already in write mode")
+        return ExecutionContext(
+            request_context=self.request_context,
+            clock=self.clock,
+            uuid_provider=self.uuid_provider,
+            write_mode=True,
+        )
+
+    def with_request_context(self, request_context: RequestContext) -> "ExecutionContext":
+        return ExecutionContext(
+            request_context=request_context,
+            clock=self.clock,
+            uuid_provider=self.uuid_provider,
+            write_mode=self.write_mode,
+        )
+
+
+
+===== core/registry/scopes.py =====
+
+"""
+GA Enterprise Core — Registry Scopes
+------------------------------------
+
+LAYER: L3+ (LAST)
+Dependencies: stdlib only
+
+Scopes:
+- PROCESS
+- APPLICATION
+- TENANT
+- REQUEST
+
+Resolution precedence:
+REQUEST → TENANT → APPLICATION → PROCESS
+"""
+
+from __future__ import annotations
+
+from enum import Enum, auto
+from typing import Tuple
+
+
+class RegistryScope(Enum):
+    PROCESS = auto()
+    APPLICATION = auto()
+    TENANT = auto()
+    REQUEST = auto()
+
+
+DEFAULT_SCOPE_CHAIN: Tuple[RegistryScope, ...] = (
+    RegistryScope.REQUEST,
+    RegistryScope.TENANT,
+    RegistryScope.APPLICATION,
+    RegistryScope.PROCESS,
+)
+
+def scope_rank(scope: RegistryScope) -> int:
+    return DEFAULT_SCOPE_CHAIN.index(scope)
+
+
+
+===== core/registry/services.py =====
+
+"""
+GA Enterprise Core — Service Registry
+-------------------------------------
+
+LAYER: L3+ (LAST)
+Dependencies:
+- core.registry.scopes
+- core.registry.freeze_guard
+- core.errors
+- core.kernel.invariants
+
+Rules:
+- No IO / No threads / No async / No logging
+- No globals; instantiate ServiceRegistry
+- Deterministic resolution by scope precedence
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Dict, Tuple, Any, Optional
+
+from core.registry.scopes import RegistryScope, DEFAULT_SCOPE_CHAIN, scope_rank
+from core.registry.freeze_guard import assert_registry_mutable
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError, ValidationError
+
+
+class ServiceNotFoundError(InvariantViolationError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _ServiceEntry:
+    name: str
+    scope: RegistryScope
+    instance: Optional[Any] = None
+    factory: Optional[Callable[[], Any]] = None
+
+
+class ServiceRegistry:
+    def __init__(self) -> None:
+        self._services: Dict[Tuple[RegistryScope, str], _ServiceEntry] = {}
+
+    def register_instance(self, name: str, instance: Any, scope: RegistryScope = RegistryScope.PROCESS) -> None:
+        assert_registry_mutable()
+        assert_not_none(name, "name")
+        assert_not_none(instance, "instance")
+        key = (scope, name)
+        if key in self._services:
+            raise ValidationError(f"Service {name!r} already registered for scope={scope.name}")
+        self._services[key] = _ServiceEntry(name=name, scope=scope, instance=instance, factory=None)
+
+    def register_factory(self, name: str, factory: Callable[[], Any], scope: RegistryScope = RegistryScope.PROCESS) -> None:
+        assert_registry_mutable()
+        assert_not_none(name, "name")
+        assert_not_none(factory, "factory")
+        key = (scope, name)
+        if key in self._services:
+            raise ValidationError(f"Service {name!r} already registered for scope={scope.name}")
+        self._services[key] = _ServiceEntry(name=name, scope=scope, instance=None, factory=factory)
+
+    def resolve(self, name: str, *, scope_chain: Tuple[RegistryScope, ...] = DEFAULT_SCOPE_CHAIN, construct: bool = True) -> Any:
+        assert_not_none(name, "name")
+        for scope in scope_chain:
+            entry = self._services.get((scope, name))
+            if entry is None:
+                continue
+            if entry.instance is not None:
+                return entry.instance
+            if entry.factory is not None:
+                return entry.factory() if construct else entry.factory
+        raise ServiceNotFoundError(f"Service {name!r} not found for scopes={[s.name for s in scope_chain]}")
+
+    def try_resolve(self, name: str, *, scope_chain: Tuple[RegistryScope, ...] = DEFAULT_SCOPE_CHAIN, construct: bool = True) -> Optional[Any]:
+        try:
+            return self.resolve(name, scope_chain=scope_chain, construct=construct)
+        except ServiceNotFoundError:
+            return None
+
+    def list_names(self) -> Tuple[str, ...]:
+        seen = []
+        for (_scope, name) in self._services.keys():
+            if name not in seen:
+                seen.append(name)
+        return tuple(seen)
+
+    def list_scoped(self) -> Tuple[Tuple[RegistryScope, str], ...]:
+        return tuple(self._services.keys())
+
+
+
+===== core/registry/registry.py =====
+
+"""
+GA Enterprise Core — Core Registry Facade
+-----------------------------------------
+
+LAYER: L3+ (LAST)
+Dependencies:
+- core.registry.services
+- core.registry.handlers
+- core.registry.scopes
+- core.registry.freeze_guard
+
+Notes:
+- Facade that composes service and handler registries.
+- Still no globals — caller constructs CoreRegistry where needed.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from core.registry.services import ServiceRegistry
+from core.registry.handlers import HandlerRegistry
+
+
+@dataclass(frozen=True, slots=True)
+class CoreRegistry:
+    services: ServiceRegistry
+    handlers: HandlerRegistry
+
+    @staticmethod
+    def create() -> "CoreRegistry":
+        return CoreRegistry(services=ServiceRegistry(), handlers=HandlerRegistry())
+
+
+
+===== core/registry/handlers.py =====
+
+"""
+GA Enterprise Core — Handler Registry
+-------------------------------------
+
+LAYER: L3+ (LAST)
+Dependencies:
+- core.registry.scopes
+- core.registry.freeze_guard
+- core.kernel.invariants
+- core.errors
+
+Rules:
+- Deterministic registration order
+- No IO / No threads / No async / No logging
+- No background dispatch
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Tuple
+
+from core.registry.scopes import RegistryScope, DEFAULT_SCOPE_CHAIN
+from core.registry.freeze_guard import assert_registry_mutable
+from core.kernel.invariants import assert_not_none
+from core.errors import ValidationError
+
+
+EventHandler = Callable[[object], None]
+
+
+@dataclass(frozen=True, slots=True)
+class _HandlerEntry:
+    key: str
+    scope: RegistryScope
+    handler: EventHandler
+    name: str
+
+
+class HandlerRegistry:
+    def __init__(self) -> None:
+        self._handlers: Dict[Tuple[RegistryScope, str], List[_HandlerEntry]] = {}
+
+    def register(self, key: str, handler: EventHandler, *, scope: RegistryScope = RegistryScope.PROCESS, name: str | None = None) -> None:
+        assert_registry_mutable()
+        assert_not_none(key, "key")
+        assert_not_none(handler, "handler")
+        entry = _HandlerEntry(key=key, scope=scope, handler=handler, name=name or getattr(handler, "__name__", "<handler>"))
+        bucket_key = (scope, key)
+        bucket = self._handlers.get(bucket_key)
+        if bucket is None:
+            self._handlers[bucket_key] = [entry]
+        else:
+            if any(h.handler is handler for h in bucket):
+                raise ValidationError(f"Handler already registered for key={key!r} scope={scope.name}")
+            bucket.append(entry)
+
+    def list_for(self, key: str, *, scope_chain: Tuple[RegistryScope, ...] = DEFAULT_SCOPE_CHAIN) -> Tuple[EventHandler, ...]:
+        assert_not_none(key, "key")
+        result: List[EventHandler] = []
+        for scope in scope_chain:
+            bucket = self._handlers.get((scope, key))
+            if not bucket:
+                continue
+            result.extend(h.handler for h in bucket)
+        return tuple(result)
+
+    def list_descriptors(self, key: str, *, scope_chain: Tuple[RegistryScope, ...] = DEFAULT_SCOPE_CHAIN) -> Tuple[Tuple[str, str], ...]:
+        pairs: List[Tuple[str, str]] = []
+        for scope in scope_chain:
+            bucket = self._handlers.get((scope, key))
+            if not bucket:
+                continue
+            pairs.extend((scope.name, h.name) for h in bucket)
+        return tuple(pairs)
+
+
+
+===== core/registry/__init__.py =====
+
+"""
+GA Enterprise Core — Registry (Final Binding Layer)
+
+LAYER: L3+ (LAST)
+
+Purpose:
+- Deterministic binding of services and handlers
+- Scoped resolution (REQUEST → TENANT → APPLICATION → PROCESS)
+- Freeze guard: no mutations after kernel.freeze
+
+Rules:
+- No IO / No threads / No async / No logging
+- No globals, no singletons: compose a CoreRegistry where needed
+- Deterministic order preserved by insertion
+"""
+
+from .scopes import RegistryScope, DEFAULT_SCOPE_CHAIN, scope_rank
+from .services import ServiceRegistry, ServiceNotFoundError
+from .handlers import HandlerRegistry
+from .registry import CoreRegistry
+from .freeze_guard import assert_registry_mutable
+
+__all__ = [
+    "RegistryScope",
+    "DEFAULT_SCOPE_CHAIN",
+    "scope_rank",
+    "ServiceRegistry",
+    "ServiceNotFoundError",
+    "HandlerRegistry",
+    "CoreRegistry",
+    "assert_registry_mutable",
+]
+
+
+
+===== core/registry/freeze_guard.py =====
+
+"""
+GA Enterprise Core — Registry Freeze Guard
+------------------------------------------
+
+LAYER: L3+ (LAST)
+Dependencies:
+- core.kernel.freeze
+
+Rules:
+- All mutating operations in registry must call assert_registry_mutable()
+- Freeze is global and irreversible (delegated to kernel.freeze)
+"""
+
+from __future__ import annotations
+
+from core.kernel.freeze import assert_kernel_mutable
+
+def assert_registry_mutable() -> None:
+    assert_kernel_mutable()
+
+
+
+===== core/registry/base.py =====
+
+"""
+GA Enterprise Core — Registry Base Types
+----------------------------------------
+
+LAYER: L3+ (LAST)
+Dependencies:
+- core.errors
+- core.kernel.invariants
+
+Notes:
+- Keep minimal, deterministic building blocks shared by submodules.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Any
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceDescriptor:
+    name: str
+    scope: str
+
+
+@dataclass(frozen=True, slots=True)
+class HandlerDescriptor:
+    kind: str
+    key: str
+    scope: str
+    fn_name: str
+
+
+
+===== core/errors/__init__.py =====
+
+from .base import (
+    CoreError,
+    KernelFrozenError,
+    InvariantViolationError,
+    ValidationError,
+    GrammarViolationError,
+    AuthorizationError,
+    TenantIsolationError,
+    StrictWriteViolationError,
+    IdempotencyViolationError,
+)
+
+__all__ = [
+    "CoreError",
+    "KernelFrozenError",
+    "InvariantViolationError",
+    "ValidationError",
+    "GrammarViolationError",
+    "AuthorizationError",
+    "TenantIsolationError",
+    "StrictWriteViolationError",
+    "IdempotencyViolationError",
+]
+
+
+
+===== core/errors/base.py =====
+
+"""
+GA Enterprise Core — Deterministic Error Hierarchy
+--------------------------------------------------
+
+LAYER: L0 (Bedrock)
+Dependencies: stdlib only
+Deterministic: YES
+Infrastructure: NONE
+Time access: NONE
+UUID access: NONE
+
+Rules:
+- All core errors must derive from CoreError.
+- Errors must be immutable.
+- Errors must be reproducible (no dynamic message mutation).
+- No side effects.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+
+# ============================================================
+# Base Error
+# ============================================================
+
+@dataclass(frozen=True, slots=True)
+class CoreError(Exception):
+    """
+    Root deterministic error for the entire GA core.
+
+    Invariants:
+    - Immutable (frozen dataclass + slots)
+    - Deterministic message and code
+    - No contextual mutation or ambient state
+    - stdlib-only (L0-safe)
+    """
+
+    message: str
+    code: str
+    cause: Optional[BaseException] = None
+
+    def __post_init__(self) -> None:
+        # Ensure Exception machinery is correctly populated deterministically.
+        object.__setattr__(self, "args", (self.message,))
+        if self.cause is not None:
+            object.__setattr__(self, "__cause__", self.cause)
+
+    def __str__(self) -> str:
+        return f"[{self.code}] {self.message}"
+
+
+# ============================================================
+# Kernel Errors
+# ============================================================
+
+class KernelFrozenError(CoreError):
+    """Raised when mutation occurs after kernel freeze."""
+
+    def __init__(self, message: str = "Kernel is frozen and cannot be modified"):
+        super().__init__(message=message, code="KERNEL_FROZEN")
+
+
+class InvariantViolationError(CoreError):
+    """Raised when a kernel invariant is violated."""
+
+    def __init__(self, message: str):
+        super().__init__(message=message, code="INVARIANT_VIOLATION")
+
+
+# ============================================================
+# Validation Errors
+# ============================================================
+
+class ValidationError(CoreError):
+    """Input or structural validation failure."""
+
+    def __init__(self, message: str):
+        super().__init__(message=message, code="VALIDATION_ERROR")
+
+
+class GrammarViolationError(CoreError):
+    """Raised when a grammar rule (regex authority) is violated."""
+
+    def __init__(self, message: str):
+        super().__init__(message=message, code="GRAMMAR_VIOLATION")
+
+
+# ============================================================
+# Authorization / Governance
+# ============================================================
+
+class AuthorizationError(CoreError):
+    """Raised when access control denies execution."""
+
+    def __init__(self, message: str = "Access denied"):
+        super().__init__(message=message, code="AUTHORIZATION_DENIED")
+
+
+class TenantIsolationError(CoreError):
+    """Raised when cross-tenant access is attempted."""
+
+    def __init__(self, message: str = "Tenant isolation violation"):
+        super().__init__(message=message, code="TENANT_ISOLATION_VIOLATION")
+
+
+# ============================================================
+# Execution Discipline
+# ============================================================
+
+class StrictWriteViolationError(CoreError):
+    """Raised when write operation occurs outside strict write-mode."""
+
+    def __init__(self, message: str = "Write operation outside strict write mode"):
+        super().__init__(message=message, code="STRICT_WRITE_VIOLATION")
+
+
+class IdempotencyViolationError(CoreError):
+    """Raised when idempotency constraints are violated."""
+
+    def __init__(self, message: str):
+        super().__init__(message=message, code="IDEMPOTENCY_VIOLATION")
+
+
+
+===== core/events/event.py =====
+
+"""
+GA Enterprise Core — Immutable Domain Event
+-------------------------------------------
+
+LAYER: L2
+Dependencies:
+- core.typing
+- core.kernel.invariants
+
+Rules:
+- Immutable
+- No time access
+- No ID generation
+- No mutation
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Mapping, Any
+
+from core.typing import EventId
+from core.kernel.invariants import assert_not_none
+
+
+@dataclass(frozen=True, slots=True)
+class DomainEvent:
+    """
+    Immutable domain event.
+
+    event_id must be injected.
+    payload must be deterministic.
+    """
+
+    event_id: EventId
+    event_type: str
+    payload: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.event_id, "event_id")
+        assert_not_none(self.event_type, "event_type")
+        assert_not_none(self.payload, "payload")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": str(self.event_id),
+            "event_type": self.event_type,
+            "payload": dict(self.payload),
+        }
+
+
+
+===== core/events/__init__.py =====
+
+"""
+GA Enterprise Core — Event Spine
+
+LAYER: L2
+
+Purpose:
+- Immutable domain events
+- Canonical event envelopes
+- Deterministic hashing
+- In-process dispatcher (no IO)
+"""
+
+from .event import DomainEvent
+from .headers import EventHeaders
+from .envelope import EventEnvelope
+from .bus import InProcessEventBus
+
+__all__ = [
+    "DomainEvent", "EventHeaders", "EventEnvelope", "InProcessEventBus",
+]
+
+
+
+===== core/events/bus.py =====
+
+"""
+GA Enterprise Core — In-Process Event Bus
+-----------------------------------------
+
+LAYER: L2
+Dependencies:
+- core.events.envelope
+- core.kernel.invariants
+
+Rules:
+- No threading
+- No async
+- No IO
+- Deterministic ordering
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import Callable, Dict, List
+
+from core.events.envelope import EventEnvelope
+from core.kernel.invariants import assert_not_none
+
+
+EventHandler = Callable[[EventEnvelope], None]
+
+
+class InProcessEventBus:
+    """
+    Deterministic in-process event dispatcher.
+    """
+
+    def __init__(self) -> None:
+        self._handlers: Dict[str, List[EventHandler]] = defaultdict(list)
+
+    def register(self, event_type: str, handler: EventHandler) -> None:
+        assert_not_none(event_type, "event_type")
+        assert_not_none(handler, "handler")
+        self._handlers[event_type].append(handler)
+
+    def dispatch(self, envelope: EventEnvelope) -> None:
+        assert_not_none(envelope, "envelope")
+        handlers = self._handlers.get(envelope.event.event_type, [])
+        for handler in handlers:
+            handler(envelope)
+
+
+
+===== core/events/headers.py =====
+
+"""
+GA Enterprise Core — Event Headers
+----------------------------------
+
+LAYER: L2
+Dependencies:
+- core.typing
+- core.kernel.invariants
+
+Rules:
+- Immutable
+- Canonical fields only
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from core.typing import (
+    CorrelationId,
+    CausationId,
+    TenantId,
+    UnixMillis,
+)
+from core.kernel.invariants import assert_not_none
+from core.errors import InvariantViolationError
+
+
+@dataclass(frozen=True, slots=True)
+class EventHeaders:
+    """
+    Canonical event headers.
+    """
+
+    correlation_id: CorrelationId
+    causation_id: CausationId
+    timestamp_ms: UnixMillis
+    tenant_id: TenantId | None = None
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.correlation_id, "correlation_id")
+        assert_not_none(self.causation_id, "causation_id")
+        assert_not_none(self.timestamp_ms, "timestamp_ms")
+        if self.timestamp_ms < 0:
+            raise InvariantViolationError("timestamp_ms cannot be negative")
+
+    def to_dict(self) -> dict[str, str | int | None]:
+        return {
+            "correlation_id": str(self.correlation_id),
+            "causation_id": str(self.causation_id),
+            "timestamp_ms": int(self.timestamp_ms),
+            "tenant_id": str(self.tenant_id) if self.tenant_id else None,
+        }
+
+
+
+===== core/events/envelope.py =====
+
+"""
+GA Enterprise Core — Deterministic Event Envelope
+-------------------------------------------------
+
+LAYER: L2
+Dependencies:
+- core.events.event
+- core.events.headers
+- stdlib hashlib/json
+
+Rules:
+- Immutable
+- Deterministic hash
+- Canonical JSON encoding
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass
+
+from core.events.event import DomainEvent
+from core.events.headers import EventHeaders
+from core.kernel.invariants import assert_not_none
+
+
+@dataclass(frozen=True, slots=True)
+class EventEnvelope:
+    """
+    Immutable event envelope.
+
+    Combines:
+    - DomainEvent
+    - EventHeaders
+    - Deterministic content hash
+    """
+
+    event: DomainEvent
+    headers: EventHeaders
+    content_hash: str
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.event, "event")
+        assert_not_none(self.headers, "headers")
+        assert_not_none(self.content_hash, "content_hash")
+
+    @staticmethod
+    def create(event: DomainEvent, headers: EventHeaders) -> "EventEnvelope":
+        canonical = {
+            "event": event.to_dict(),
+            "headers": headers.to_dict(),
+        }
+        encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        return EventEnvelope(event=event, headers=headers, content_hash=digest)
+
+
+
+===== core/guards/idempotency.py =====
+
+"""
+GA Enterprise Core — Idempotency (Pure Transitions)
+---------------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.typing (UnixMillis)
+- core.errors (InvariantViolationError)
+- core.kernel.invariants (assert_not_none)
+
+Rules:
+- No globals / no IO
+- Immutable records
+- Deterministic transitions
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Optional
+
+from core.typing import UnixMillis
+from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
+
+
+class IdempotencyStatus(Enum):
+    IN_PROGRESS = auto()
+    COMPLETED = auto()
+    REJECTED = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class IdempotencyRecord:
+    key: str
+    status: IdempotencyStatus
+    first_seen_ms: UnixMillis
+    last_seen_ms: UnixMillis
+    response_hash: Optional[str] = None
+    reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        assert_not_none(self.key, "key")
+        if self.first_seen_ms < 0 or self.last_seen_ms < 0:
+            raise InvariantViolationError("timestamps cannot be negative")
+
+
+def idempotency_start(existing: Optional[IdempotencyRecord], *, key: str, now_ms: UnixMillis) -> tuple[IdempotencyRecord, bool]:
+    if now_ms < 0:
+        raise InvariantViolationError("now_ms cannot be negative")
+    if existing is None:
+        rec = IdempotencyRecord(key=key, status=IdempotencyStatus.IN_PROGRESS, first_seen_ms=now_ms, last_seen_ms=now_ms)
+        return rec, True
+    return (
+        IdempotencyRecord(
+            key=existing.key,
+            status=existing.status,
+            first_seen_ms=existing.first_seen_ms,
+            last_seen_ms=now_ms,
+            response_hash=existing.response_hash,
+            reason=existing.reason,
+        ),
+        False,
+    )
+
+
+def idempotENCY_complete(existing: IdempotencyRecord, *, response_hash: str, now_ms: UnixMillis) -> IdempotencyRecord:
+    # NOTE: Fix casing to match exported name below; keep function name lower-case in export
+    if existing.status is IdempotencyStatus.COMPLETED:
+        return IdempotencyRecord(
+            key=existing.key,
+            status=IdempotencyStatus.COMPLETED,
+            first_seen_ms=existing.first_seen_ms,
+            last_seen_ms=now_ms,
+            response_hash=existing.response_hash or response_hash,
+            reason=None,
+        )
+    return IdempotencyRecord(
+        key=existing.key,
+        status=IdempotencyStatus.COMPLETED,
+        first_seen_ms=existing.first_seen_ms,
+        last_seen_ms=now_ms,
+        response_hash=response_hash,
+        reason=None,
+    )
+
+# Provide correctly cased alias
+
+def idempotency_complete(existing: IdempotencyRecord, *, response_hash: str, now_ms: UnixMillis) -> IdempotencyRecord:
+    return idempotENCY_complete(existing, response_hash=response_hash, now_ms=now_ms)
+
+
+def idempotency_reject(existing: IdempotencyRecord | None, *, key: str, reason: str, now_ms: UnixMillis) -> IdempotencyRecord:
+    if existing is None:
+        return IdempotencyRecord(key=key, status=IdempotencyStatus.REJECTED, first_seen_ms=now_ms, last_seen_ms=now_ms, response_hash=None, reason=reason)
+    return IdempotencyRecord(key=existing.key, status=IdempotencyStatus.REJECTED, first_seen_ms=existing.first_seen_ms, last_seen_ms=now_ms, response_hash=None, reason=reason)
+
+
+def is_replay_of(existing: Optional[IdempotencyRecord], *, response_hash: str | None) -> bool:
+    if existing is None:
+        return False
+    if existing.status is not IdempotencyStatus.COMPLETED:
+        return False
+    if response_hash is None:
+        return True
+    return existing.response_hash == response_hash
+
+
+
+===== core/guards/__init__.py =====
+
+"""
+GA Enterprise Core — Guards (Pure Governance Logic)
+
+LAYER: L3
+
+Purpose:
+- Preconditions (deterministic guardrails)
+- Idempotency (pure state transitions)
+- Rate limiting (pure token bucket)
+- Circuit breaker (pure closed/open/half-open logic)
+
+Rules:
+- No globals / no thread-locals
+- No IO / no logging / no async / no threads
+- Deterministic, replay-safe
+"""
+
+from .preconditions import (
+    require,
+    require_present,
+    require_non_empty_str,
+    require_equal,
+    require_allowed,
+)
+from .idempotency import (
+    IdempotencyStatus,
+    IdempotencyRecord,
+    idempotency_start,
+    idempotency_complete,
+    idempotency_reject,
+    is_replay_of,
+)
+from .rate_limit import (
+    TokenBucketPolicy,
+    TokenBucketState,
+    try_consume,
+)
+from .circuit_breaker import (
+    CircuitState,
+    CircuitPolicy,
+    CircuitSnapshot,
+    can_execute,
+    record_success,
+    record_failure,
+)
+
+__all__ = [
+    "require", "require_present", "require_non_empty_str", "require_equal", "require_allowed",
+    "IdempotencyStatus", "IdempotencyRecord", "idempotency_start", "idempotency_complete", "idempotency_reject", "is_replay_of",
+    "TokenBucketPolicy", "TokenBucketState", "try_consume",
+    "CircuitState", "CircuitPolicy", "CircuitSnapshot", "can_execute", "record_success", "record_failure",
+]
+
+
+
+===== core/guards/circuit_breaker.py =====
+
+"""
+GA Enterprise Core — Circuit Breaker (Pure)
+-------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.typing (UnixMillis)
+- core.errors (InvariantViolationError)
+
+Rules:
+- No globals / no IO / no threads
+- Deterministic state transitions (time injected)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum, auto
+
+from core.typing import UnixMillis
+from core.errors import InvariantViolationError
+
+
+class CircuitState(Enum):
+    CLOSED = auto()
+    OPEN = auto()
+    HALF_OPEN = auto()
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitPolicy:
+    failure_threshold: int = 5
+    open_duration_ms: int = 30_000
+    half_open_max_calls: int = 1
+    half_open_successes_to_close: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitSnapshot:
+    state: CircuitState = CircuitState.CLOSED
+    opened_ms: UnixMillis = 0
+    consecutive_failures: int = 0
+    half_open_inflight: int = 0
+    half_open_successes: int = 0
+
+
+def _to_open(now_ms: UnixMillis, snap: CircuitSnapshot) -> CircuitSnapshot:
+    return CircuitSnapshot(state=CircuitState.OPEN, opened_ms=now_ms, consecutive_failures=snap.consecutive_failures)
+
+
+def _to_half_open(now_ms: UnixMillis) -> CircuitSnapshot:
+    return CircuitSnapshot(state=CircuitState.HALF_OPEN, opened_ms=now_ms)
+
+
+def _to_closed() -> CircuitSnapshot:
+    return CircuitSnapshot(state=CircuitState.CLOSED, opened_ms=0)
+
+
+def can_execute(snap: CircuitSnapshot, now_ms: UnixMillis, policy: CircuitPolicy) -> tuple[CircuitSnapshot, bool]:
+    if now_ms < 0:
+        raise InvariantViolationError("now_ms cannot be negative")
+    if snap.state is CircuitState.CLOSED:
+        return snap, True
+    if snap.state is CircuitState.OPEN:
+        if now_ms - snap.opened_ms >= policy.open_duration_ms:
+            ns = _to_half_open(now_ms)
+            if policy.half_open_max_calls <= 0:
+                return ns, False
+            return CircuitSnapshot(state=CircuitState.HALF_OPEN, opened_ms=ns.opened_ms, consecutive_failures=0, half_open_inflight=1, half_open_successes=0), True
+        return snap, False
+    if snap.half_open_inflight < policy.half_open_max_calls:
+        return CircuitSnapshot(state=CircuitState.HALF_OPEN, opened_ms=snap.opened_ms, consecutive_failures=snap.consecutive_failures, half_open_inflight=snap.half_open_inflight + 1, half_open_successes=snap.half_open_successes), True
+    return snap, False
+
+
+def record_success(snap: CircuitSnapshot, now_ms: UnixMillis, policy: CircuitPolicy) -> CircuitSnapshot:
+    if snap.state is CircuitState.CLOSED:
+        return CircuitSnapshot(state=CircuitState.CLOSED, opened_ms=0, consecutive_failures=0, half_open_inflight=0, half_open_successes=0)
+    if snap.state is CircuitState.OPEN:
+        return snap
+    successes = snap.half_open_successes + 1
+    inflight = max(0, snap.half_open_inflight - 1)
+    if successes >= policy.half_open_successes_to_close:
+        return _to_closed()
+    return CircuitSnapshot(state=CircuitState.HALF_OPEN, opened_ms=snap.opened_ms, consecutive_failures=0, half_open_inflight=inflight, half_open_successes=successes)
+
+
+def record_failure(snap: CircuitSnapshot, now_ms: UnixMillis, policy: CircuitPolicy) -> CircuitSnapshot:
+    if snap.state is CircuitState.CLOSED:
+        fails = snap.consecutive_failures + 1
+        if fails >= policy.failure_threshold:
+            return _to_open(now_ms, CircuitSnapshot(state=snap.state, opened_ms=snap.opened_ms, consecutive_failures=fails))
+        return CircuitSnapshot(state=CircuitState.CLOSED, opened_ms=0, consecutive_failures=fails, half_open_inflight=0, half_open_successes=0)
+    if snap.state is CircuitState.OPEN:
+        return snap
+    inflight = max(0, snap.half_open_inflight - 1)
+    _ = inflight
+    return _to_open(now_ms, snap)
+
+
+
+===== core/guards/rate_limit.py =====
+
+"""
+GA Enterprise Core — Rate Limiting (Pure Token Bucket)
+------------------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.typing (UnixMillis)
+- core.errors (InvariantViolationError)
+- core.kernel.invariants (assert_not_none)
+
+Rules:
+- No globals / no IO / no threads
+- Deterministic refill based on injected timestamps
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from core.typing import UnixMillis
+from core.errors import InvariantViolationError
+
+
+@dataclass(frozen=True, slots=True)
+class TokenBucketPolicy:
+    capacity: int
+    refill_rate_per_ms: float
+
+
+@dataclass(frozen=True, slots=True)
+class TokenBucketState:
+    tokens: float
+    last_refill_ms: UnixMillis
+
+
+def _refill(state: TokenBucketState, now_ms: UnixMillis, policy: TokenBucketPolicy) -> TokenBucketState:
+    if now_ms < state.last_refill_ms:
+        raise InvariantViolationError("now_ms must be >= last_refill_ms")
+    elapsed = int(now_ms) - int(state.last_refill_ms)
+    if elapsed <= 0:
+        return state
+    new_tokens = min(policy.capacity, state.tokens + elapsed * policy.refill_rate_per_ms)
+    return TokenBucketState(tokens=new_tokens, last_refill_ms=now_ms)
+
+
+def try_consume(state: TokenBucketState, now_ms: UnixMillis, policy: TokenBucketPolicy, cost: int = 1) -> tuple[TokenBucketState, bool]:
+    if cost <= 0:
+        raise InvariantViolationError("cost must be positive")
+    s = _refill(state, now_ms, policy)
+    if s.tokens >= cost:
+        return TokenBucketState(tokens=s.tokens - cost, last_refill_ms=s.last_refill_ms), True
+    return s, False
+
+
+
+===== core/guards/preconditions.py =====
+
+"""
+GA Enterprise Core — Preconditions (Deterministic Guards)
+---------------------------------------------------------
+
+LAYER: L3
+Dependencies:
+- core.errors (InvariantViolationError, ValidationError, AuthorizationError)
+- core.kernel.invariants (assert_not_none)
+
+Rules:
+- Pure helpers
+- Deterministic, no side effects
+"""
+
+from __future__ import annotations
+
+from typing import Any, Type
+
+from core.kernel.invariants import assert_not_none
+from core.errors import (
+    InvariantViolationError,
+    ValidationError,
+    AuthorizationError,
+)
+
+
+def require(condition: bool, message: str, *, error: Type[Exception] = InvariantViolationError) -> None:
+    if condition is not True:
+        raise error(message)
+
+
+def require_present(value: Any, name: str) -> None:
+    assert_not_none(value, name)
+
+
+def require_non_empty_str(value: str | None, name: str) -> None:
+    if value is None or len(value.strip()) == 0:
+        raise ValidationError(f"{name} must be a non-empty string")
+
+
+def require_equal(a: Any, b: Any, message: str = "Values must be equal") -> None:
+    if a != b:
+        raise InvariantViolationError(message)
+
+
+def require_allowed(allowed: bool, message: str = "Access denied") -> None:
+    if not allowed:
+        raise AuthorizationError(message)
+
+
+
+===== core/kernel/__init__.py =====
+
+"""
+GA Enterprise Core — Kernel Authority
+
+LAYER: L0
+Purpose:
+- Global freeze control
+- Kernel invariant enforcement
+"""
+
+from .freeze import (
+    freeze_kernel,
+    is_kernel_frozen,
+    assert_kernel_mutable,
+)
+
+from .invariants import (
+    assert_invariant,
+    assert_not_none,
+    assert_true,
+)
+
+__all__ = [
+    "freeze_kernel", "is_kernel_frozen", "assert_kernel_mutable",
+    "assert_invariant", "assert_not_none", "assert_true",
+]
+
+
+
+===== core/kernel/freeze.py =====
+
+"""
+GA Enterprise Core — Global Freeze Authority
+--------------------------------------------
+
+LAYER: L0
+Dependencies: core.errors only
+Deterministic: YES
+Threading: NONE (by design)
+IO: NONE
+
+Rules:
+- Freeze is irreversible.
+- Freeze is global.
+- No auto-freeze.
+- No implicit mutation.
+- Freeze must be explicit.
+"""
+
+from __future__ import annotations
+
+from typing import Final
+
+from core.errors import KernelFrozenError
+
+
+# ============================================================
+# Internal Freeze State
+# ============================================================
+
+_KERNEL_FROZEN: bool = False
+
+FREEZE_SENTINEL: Final[str] = "GA_KERNEL_FROZEN_V1"
+
+
+# ============================================================
+# Public API
+# ============================================================
+
+def freeze_kernel() -> str:
+    """
+    Irreversibly freezes the kernel.
+
+    Returns:
+        A deterministic sentinel string for audit purposes.
+
+    Raises:
+        KernelFrozenError: if already frozen.
+    """
+    global _KERNEL_FROZEN
+
+    if _KERNEL_FROZEN:
+        raise KernelFrozenError("Kernel is already frozen")
+
+    _KERNEL_FROZEN = True
+    return FREEZE_SENTINEL
+
+
+def is_kernel_frozen() -> bool:
+    """
+    Returns current freeze state.
+    Pure read. No mutation.
+    """
+    return _KERNEL_FROZEN
+
+
+def assert_kernel_mutable() -> None:
+    """
+    Raises if the kernel has been frozen.
+
+    Must be called by:
+    - Registries
+    - Grammar authorities
+    - Policy mutation points
+    """
+    if _KERNEL_FROZEN:
+        raise KernelFrozenError()
+
+
+
+===== core/kernel/invariants.py =====
+
+"""
+GA Enterprise Core — Kernel Invariant Enforcement
+-------------------------------------------------
+
+LAYER: L0
+Dependencies: core.errors only
+Deterministic: YES
+Side effects: NONE
+
+Purpose:
+- Replace raw `assert` statements
+- Provide deterministic invariant failures
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from core.errors import InvariantViolationError
+
+
+# ============================================================
+# Base Invariant
+# ============================================================
+
+def assert_invariant(condition: bool, message: str) -> None:
+    """
+    Enforces a deterministic invariant.
+
+    Raises:
+        InvariantViolationError if condition is False.
+    """
+    if not condition:
+        raise InvariantViolationError(message)
+
+
+# ============================================================
+# Common Assertions
+# ============================================================
+
+def assert_not_none(value: Any, name: str) -> None:
+    """
+    Ensures a value is not None.
+    """
+    if value is None:
+        raise InvariantViolationError(f"{name} must not be None")
+
+
+def assert_true(condition: bool, message: str) -> None:
+    """
+    Alias for explicit boolean checks.
+    """
+    if condition is not True:
+        raise InvariantViolationError(message)
+
+
+

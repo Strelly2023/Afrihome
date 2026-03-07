@@ -1,0 +1,3609 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional, Protocol
+from core.errors import ValidationError, OutboxDeliveryError
+from core.typing import TenantId, Millis, JSONObject, OutboxHeaders
+from core.time.clock import now_ms
+from core.outbox.model import OutboxRecord
+from core.outbox.backoff import Backoff, ExponentialBackoff
+from core.outbox.store_protocol import OutboxStore
+
+class Transport(Protocol):
+    def send(self, *, key: str, topic: str, payload: JSONObject, headers: Optional[OutboxHeaders] = None) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class Dispatcher:
+    store: OutboxStore
+    transport: Transport
+    backoff: Backoff = ExponentialBackoff()
+
+    def dispatch(self, *, tenant_id: Optional[TenantId] = None, limit: int = 100, now: Optional[int] = None) -> int:
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValidationError('limit must be a positive integer')
+        now_ms_value = int(now if now is not None else now_ms())
+        batch = self.store.fetch_ready(tenant_id=tenant_id, limit=limit, now_ms_value=Millis(now_ms_value))
+        if not batch:
+            return 0
+        sent = 0
+        for rec in batch:
+            try:
+                self.transport.send(key=rec.effective_key(), topic=rec.topic, payload=rec.payload, headers=rec.headers)
+                self.store.upsert(rec.mark_sent())
+                sent += 1
+            except Exception as exc:
+                err_msg = str(exc)[:512] if str(exc) else 'transport failure'
+                failed = rec.mark_failed(error_code=OutboxDeliveryError.code, error_message=err_msg, attempt_ts=now_ms_value)
+                retry = failed.schedule_retry(self.backoff, from_ts_ms=now_ms_value)
+                self.store.upsert(retry)
+                break
+        return sent
+
+    def dispatch_all(self, *, tenant_id: Optional[TenantId] = None, batch_size: int = 100, now: Optional[int] = None) -> int:
+        total = 0
+        while True:
+            n = self.dispatch(tenant_id=tenant_id, limit=batch_size, now=now)
+            if n <= 0:
+                return total
+            total += n
+from __future__ import annotations
+import re
+from typing import Final
+from core.errors import ValidationError
+
+TOPIC_RE: Final[re.Pattern[str]] = re.compile(r'^[a-z0-9._-]+$', re.ASCII)
+
+
+def normalize_topic(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError('topic must be a string')
+    return value.strip().lower()
+
+
+def is_valid_topic(value: str) -> bool:
+    try:
+        _ = validate_topic(value)
+        return True
+    except Exception:
+        return False
+
+
+def validate_topic(value: str) -> str:
+    v = normalize_topic(value)
+    if not v or not TOPIC_RE.match(v):
+        raise ValidationError('topic contains invalid characters', details={'topic': value})
+    return v
+from __future__ import annotations
+import threading
+from typing import Dict, Tuple, Optional, Sequence, List
+from core.errors import ValidationError
+from core.typing import TenantId, UUIDStr, Millis, JSONObject
+from core.outbox.model import OutboxRecord
+from core.outbox.store_protocol import OutboxStore
+
+class MemoryOutboxStore(OutboxStore):
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._records: Dict[Tuple[TenantId, UUIDStr], OutboxRecord] = {}
+
+    def save(self, record: OutboxRecord) -> None:
+        key = (record.tenant_id, record.id)
+        with self._lock:
+            if key in self._records:
+                return
+            self._records[key] = record
+
+    def upsert(self, record: OutboxRecord) -> None:
+        key = (record.tenant_id, record.id)
+        with self._lock:
+            self._records[key] = record
+
+    def fetch_ready(self, *, tenant_id: Optional[TenantId] = None, limit: int = 100, now_ms_value: Millis = Millis(0)) -> Sequence[OutboxRecord]:
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValidationError('limit must be a positive integer')
+        if not isinstance(now_ms_value, int) or now_ms_value <= 0:
+            raise ValidationError('now_ms_value must be positive integer')
+        with self._lock:
+            items: List[OutboxRecord] = [
+                rec for (t, _), rec in self._records.items()
+                if (tenant_id is None or t == tenant_id) and rec.ready(int(now_ms_value))
+            ]
+            def _due_at(r: OutboxRecord) -> int:
+                return int(r.next_retry_at if r.next_retry_at is not None else r.ts_ms)
+            items.sort(key=lambda r: (_due_at(r), int(r.ts_ms), r.id))
+            return items[:limit]
+
+    def snapshot(self) -> JSONObject:
+        with self._lock:
+            by_status: Dict[str, int] = {}
+            for rec in self._records.values():
+                by_status[rec.status] = by_status.get(rec.status, 0) + 1
+            return {'total': len(self._records), 'by_status': dict(sorted(by_status.items()))}
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Protocol
+from core.errors import ValidationError
+
+class Backoff(Protocol):
+    def delay_ms(self, retry_count: int) -> int: ...
+
+
+def _require_non_negative_int(name: str, value: int) -> None:
+    if not isinstance(value, int) or value < 0:
+        raise ValidationError(f'{name} must be a non-negative integer')
+
+
+def _require_positive_int(name: str, value: int) -> None:
+    if not isinstance(value, int) or value <= 0:
+        raise ValidationError(f'{name} must be a positive integer')
+
+
+@dataclass(frozen=True, slots=True)
+class FixedBackoff(Backoff):
+    delay: int = 1000
+    max_attempts: int = 10
+    def __post_init__(self) -> None:
+        _require_positive_int('delay', self.delay)
+        _require_positive_int('max_attempts', self.max_attempts)
+    def delay_ms(self, retry_count: int) -> int:
+        _require_non_negative_int('retry_count', retry_count)
+        return self.delay
+
+
+@dataclass(frozen=True, slots=True)
+class LinearBackoff(Backoff):
+    base_ms: int = 1000
+    step_ms: int = 1000
+    max_ms: int = 60_000
+    max_attempts: int = 10
+    def __post_init__(self) -> None:
+        _require_positive_int('base_ms', self.base_ms)
+        _require_positive_int('step_ms', self.step_ms)
+        _require_positive_int('max_ms', self.max_ms)
+        _require_positive_int('max_attempts', self.max_attempts)
+    def delay_ms(self, retry_count: int) -> int:
+        _require_non_negative_int('retry_count', retry_count)
+        delay = self.base_ms + self.step_ms * retry_count
+        return max(1, min(delay, self.max_ms))
+
+
+@dataclass(frozen=True, slots=True)
+class ExponentialBackoff(Backoff):
+    base_ms: int = 1000
+    factor: float = 2.0
+    max_ms: int = 60_000
+    max_attempts: int = 10
+    def __post_init__(self) -> None:
+        _require_positive_int('base_ms', self.base_ms)
+        if not isinstance(self.factor, (int, float)) or self.factor < 1.0:
+            raise ValidationError('factor must be a number >= 1.0')
+        _require_positive_int('max_ms', self.max_ms)
+        _require_positive_int('max_attempts', self.max_attempts)
+    def delay_ms(self, retry_count: int) -> int:
+        _require_non_negative_int('retry_count', retry_count)
+        delay = int(round(self.base_ms * (self.factor ** retry_count)))
+        return max(1, min(delay, self.max_ms))
+
+
+@dataclass(frozen=True, slots=True)
+class FibonacciBackoff(Backoff):
+    base_ms: int = 1000
+    max_ms: int = 60_000
+    max_attempts: int = 10
+    def __post_init__(self) -> None:
+        _require_positive_int('base_ms', self.base_ms)
+        _require_positive_int('max_ms', self.max_ms)
+        _require_positive_int('max_attempts', self.max_attempts)
+    def delay_ms(self, retry_count: int) -> int:
+        _require_non_negative_int('retry_count', retry_count)
+        if retry_count <= 1:
+            delay = self.base_ms
+        else:
+            a = b = self.base_ms
+            for _ in range(2, retry_count + 1):
+                a, b = b, a + b
+            delay = b
+        return max(1, min(delay, self.max_ms))
+from __future__ import annotations
+from dataclasses import dataclass, field, replace
+from typing import Optional, Final, Mapping, Dict, Any, Literal
+from core.errors import ValidationError
+from core.typing import UUIDStr, Millis, TenantId, JSONObject, OutboxHeaders, OutboxRecordShape
+from core.time.clock import now_ms
+from core.outbox.backoff import Backoff
+from core.outbox.topic_grammar import validate_topic
+from core.events.headers import validate_headers
+
+Status = Literal['PENDING', 'SENT', 'FAILED', 'DLQ']
+_MAX_KEY_LEN: Final[int] = 256
+_MAX_ATTEMPTS: Final[int] = 1000
+
+
+def _require_non_empty_str(name: str, value: Optional[str], *, max_len: int) -> str:
+    if value is None:
+        raise ValidationError(f'{name} is required')
+    if not isinstance(value, str):
+        raise ValidationError(f'{name} must be a string')
+    v = value.strip()
+    if not v:
+        raise ValidationError(f'{name} must be non-empty')
+    if len(v) > max_len:
+        raise ValidationError(f'{name} too long', details={'max_len': max_len})
+    return v
+
+
+def _validate_headers(headers: Optional[OutboxHeaders]) -> None:
+    if headers is None:
+        return
+    validate_headers(headers)
+
+
+@dataclass(frozen=True, slots=True)
+class DLQRecord:
+    id: UUIDStr
+    tenant_id: TenantId
+    topic: str
+    payload: JSONObject
+    ts_ms: Millis
+    attempts: int
+    last_error_code: Optional[str] = None
+    last_error_message: Optional[str] = None
+    last_attempt_ms: Optional[Millis] = None
+    headers: Optional[OutboxHeaders] = None
+    key: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            'id': self.id,
+            'tenant_id': self.tenant_id,
+            'topic': self.topic,
+            'payload': dict(self.payload),
+            'ts_ms': int(self.ts_ms),
+            'attempts': int(self.attempts),
+            'last_error_code': self.last_error_code,
+            'last_error_message': self.last_error_message,
+            'last_attempt_ms': self.last_attempt_ms,
+        }
+        if self.headers is not None:
+            d['headers'] = dict(self.headers)
+        if self.key is not None:
+            d['key'] = self.key
+        return d
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxRecord:
+    id: UUIDStr
+    tenant_id: TenantId
+    topic: str
+    payload: JSONObject
+    ts_ms: Millis
+    headers: Optional[OutboxHeaders] = None
+    key: Optional[str] = None
+    retry_count: int = 0
+    next_retry_at: Optional[Millis] = None
+    max_attempts: int = 10
+    status: Status = 'PENDING'
+    last_error_code: Optional[str] = field(default=None, repr=False)
+    last_error_message: Optional[str] = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        _require_non_empty_str('id', self.id, max_len=_MAX_KEY_LEN)
+        _require_non_empty_str('tenant_id', self.tenant_id, max_len=64)
+        validate_topic(self.topic)
+        if not isinstance(self.payload, dict):
+            raise ValidationError('payload must be a JSON object (dict)')
+        if not isinstance(self.ts_ms, int) or self.ts_ms <= 0:
+            raise ValidationError('ts_ms must be positive integer')
+        _validate_headers(self.headers)
+        if self.key is not None:
+            _require_non_empty_str('key', self.key, max_len=_MAX_KEY_LEN)
+        if not isinstance(self.retry_count, int) or self.retry_count < 0:
+            raise ValidationError('retry_count must be non-negative integer')
+        if (not isinstance(self.max_attempts, int) or self.max_attempts <= 0 or self.max_attempts > _MAX_ATTEMPTS):
+            raise ValidationError('max_attempts out of range')
+        if self.next_retry_at is not None and (not isinstance(self.next_retry_at, int) or self.next_retry_at <= 0):
+            raise ValidationError('next_retry_at must be positive integer when provided')
+        if self.status not in ('PENDING', 'SENT', 'FAILED', 'DLQ'):
+            raise ValidationError('invalid status', details={'status': self.status})
+
+    def effective_key(self) -> str:
+        return self.key or self.id
+
+    def ready(self, now: int) -> bool:
+        if self.status != 'PENDING':
+            return False
+        return self.next_retry_at is None or now >= int(self.next_retry_at)
+
+    def mark_sent(self) -> 'OutboxRecord':
+        if self.status == 'SENT':
+            return self
+        return replace(self, status='SENT', next_retry_at=None, last_error_code=None, last_error_message=None)
+
+    def mark_failed(self, *, error_code: Optional[str], error_message: Optional[str], attempt_ts: Optional[int] = None) -> 'OutboxRecord':
+        code = (error_code or '')[:128] or None
+        msg = (error_message or '')[:512] or None
+        return replace(self, status='FAILED', last_error_code=code, last_error_message=msg)
+
+    def schedule_retry(self, policy: Backoff, *, from_ts_ms: Optional[int] = None) -> 'OutboxRecord':
+        if self.status == 'SENT':
+            return self
+        policy_max = getattr(policy, 'max_attempts', self.max_attempts)
+        if self.retry_count + 1 >= min(self.max_attempts, policy_max):
+            return replace(self, status='FAILED', next_retry_at=None, retry_count=self.retry_count + 1)
+        base = int(from_ts_ms if from_ts_ms is not None else now_ms())
+        try:
+            delay = int(getattr(policy, 'delay_ms')(self.retry_count))
+        except Exception:
+            try:
+                delay = int(getattr(policy, 'next_delay_ms')(self.retry_count))  # legacy
+            except Exception as _e:
+                raise ValidationError('invalid backoff policy')
+        if delay <= 0:
+            raise ValidationError('backoff policy returned a non-positive delay', details={'delay': delay})
+        next_at = base + delay
+        return replace(self, status='PENDING', retry_count=self.retry_count + 1, next_retry_at=next_at)
+
+    def to_dlq(self, *, now: Optional[int] = None) -> DLQRecord:
+        ts = int(now if now is not None else now_ms())
+        return DLQRecord(
+            id=self.id,
+            tenant_id=self.tenant_id,
+            topic=self.topic,
+            payload=dict(self.payload),
+            ts_ms=ts,
+            attempts=self.retry_count,
+            last_error_code=self.last_error_code,
+            last_error_message=self.last_error_message,
+            last_attempt_ms=self.next_retry_at,
+            headers=dict(self.headers) if self.headers is not None else None,
+            key=self.key,
+        )
+
+    def to_shape(self) -> OutboxRecordShape:
+        d: OutboxRecordShape = {
+            'id': self.id,
+            'tenant_id': self.tenant_id,
+            'topic': self.topic,
+            'payload': dict(self.payload),
+            'ts_ms': int(self.ts_ms),
+            'retry_count': int(self.retry_count),
+            'next_retry_at': self.next_retry_at,
+            'max_attempts': int(self.max_attempts),
+            'status': self.status,
+        }
+        if self.headers is not None:
+            d['headers'] = dict(self.headers)
+        if self.key is not None:
+            d['key'] = self.key
+        return d
+from __future__ import annotations
+from typing import Protocol, Optional, Sequence
+from core.typing import TenantId, Millis, JSONObject
+from core.outbox.model import OutboxRecord
+
+class OutboxStore(Protocol):
+    def save(self, record: OutboxRecord) -> None: ...
+    def upsert(self, record: OutboxRecord) -> None: ...
+    def fetch_ready(self, *, tenant_id: Optional[TenantId] = None, limit: int = 100, now_ms_value: Millis = Millis(0)) -> Sequence[OutboxRecord]: ...
+    def snapshot(self) -> JSONObject: ...
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional
+from core.errors import ValidationError
+from core.typing import TenantId, UUIDStr, Millis, JSONObject, OutboxHeaders
+from core.identity.uuid import uuid7_str
+from core.events.envelope import Envelope
+from core.events.headers import validate_headers
+from core.outbox.model import OutboxRecord
+from core.outbox.topic_grammar import validate_topic
+
+@dataclass(frozen=True, slots=True)
+class OutboxWriter:
+    store: any
+    default_topic_prefix: Optional[str] = None
+
+    def _require_non_empty_str(self, name: str, value: Optional[str], *, max_len: int) -> str:
+        if value is None:
+            raise ValidationError(f'{name} is required')
+        if not isinstance(value, str):
+            raise ValidationError(f'{name} must be a string')
+        v = value.strip()
+        if not v:
+            raise ValidationError(f'{name} must be non-empty')
+        if len(v) > max_len:
+            raise ValidationError(f'{name} too long', details={'max_len': max_len})
+        return v
+
+    def _derive_topic(self, event_type: str, *, prefix: Optional[str] = None) -> str:
+        base = event_type.strip().lower()
+        topic = f"{prefix}.{base}" if (prefix and prefix.strip()) else base
+        return validate_topic(topic)
+
+    def to_record(
+        self,
+        *,
+        envelope: Envelope,
+        topic: Optional[str] = None,
+        headers: Optional[OutboxHeaders] = None,
+        key: Optional[str] = None,
+        ts_ms: Optional[Millis] = None,
+        record_id: Optional[UUIDStr] = None,
+        max_attempts: int = 10,
+    ) -> OutboxRecord:
+        tpc = topic or self._derive_topic(str(envelope.event.type), prefix=self.default_topic_prefix)
+        hdrs = headers if headers is not None else (envelope.headers or {})
+        validate_headers(hdrs)
+        k = (key or envelope.id).strip()
+        self._require_non_empty_str('key', k, max_len=256)
+        ts = int(envelope.ts_ms if ts_ms is None else ts_ms)
+        return OutboxRecord(
+            id=UUIDStr(record_id or uuid7_str()),
+            tenant_id=TenantId(envelope.tenant_id),
+            topic=tpc,
+            payload=envelope.to_dict(),
+            headers=hdrs,
+            key=k,
+            ts_ms=ts,
+            max_attempts=max_attempts,
+        )
+
+    def write(
+        self,
+        *,
+        envelope: Envelope,
+        topic: Optional[str] = None,
+        headers: Optional[OutboxHeaders] = None,
+        key: Optional[str] = None,
+        ts_ms: Optional[Millis] = None,
+        record_id: Optional[UUIDStr] = None,
+        max_attempts: int = 10,
+    ) -> OutboxRecord:
+        rec = self.to_record(
+            envelope=envelope,
+            topic=topic,
+            headers=headers,
+            key=key,
+            ts_ms=ts_ms,
+            record_id=record_id,
+            max_attempts=max_attempts,
+        )
+        self.store.save(rec)
+        return rec
+from __future__ import annotations
+from typing import Iterable
+from core.rbac.permissions import Role, PermissionGrant
+from core.rbac.grammar import validate_permission
+from core.errors import ValidationError
+
+
+def allow(permission: str) -> PermissionGrant:
+    return PermissionGrant(permission=validate_permission(permission), effect='allow')
+
+
+def deny(permission: str) -> PermissionGrant:
+    return PermissionGrant(permission=validate_permission(permission), effect='deny')
+
+
+def make_role(key: str, grants: Iterable[PermissionGrant]) -> Role:
+    k = (key or '').strip()
+    if not k:
+        raise ValidationError('role key must be non-empty')
+    return Role(k, tuple(grants))
+
+# Example built-ins (optional)
+OBSERVER = make_role('observer', (allow('core.health:read'),))
+SUPER_ADMIN = make_role('super_admin', (allow('core.*:*'),))
+
+__all__ = ['Role', 'PermissionGrant', 'allow', 'deny', 'make_role', 'OBSERVER', 'SUPER_ADMIN']
+from __future__ import annotations
+import re
+from typing import Final, Tuple
+from core.errors import ValidationError
+
+# Permission shape:
+# "<resource segments '.' separated>:<action segments '.' separated>"
+# - resource: starts with [a-z], then [a-z0-9_.-]* (segments separated by '.')
+# - action: starts with [a-z*], then [a-z0-9_.-]* (segments separated by '.')
+# - ASCII only, no spaces
+PERM_RE: Final[re.Pattern[str]] = re.compile(
+    r'^[a-z][a-z0-9_.-]*(\.[a-z0-9_.-]+)*:[a-z*][a-z0-9_.-]*(\.[a-z0-9_.-]+)*$',
+    re.ASCII,
+)
+
+
+def is_valid_permission(value: str) -> bool:
+    try:
+        _ = validate_permission(value)
+        return True
+    except Exception:
+        return False
+
+
+def validate_permission(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError('permission must be a string')
+    v = value.strip()
+    if not PERM_RE.match(v):
+        raise ValidationError('invalid permission format', details={'permission': value})
+    return v
+
+
+def split_permission(value: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    v = validate_permission(value)
+    res, act = v.split(':', 1)
+    return tuple(res.split('.')), tuple(act.split('.'))
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence
+from core.errors import ValidationError
+from core.typing import Permission as PermType, ActorId, TenantId
+from core.rbac.grammar import validate_permission
+
+@dataclass(frozen=True, slots=True)
+class PermissionGrant:
+    permission: PermType
+    effect: str = 'allow'  # 'allow' | 'deny'
+    def __post_init__(self) -> None:
+        p = PermType(validate_permission(str(self.permission)))
+        eff = (self.effect or '').strip().lower()
+        if eff not in ('allow', 'deny'):
+            raise ValidationError("effect must be 'allow' or 'deny'")
+        object.__setattr__(self, 'permission', p)
+        object.__setattr__(self, 'effect', eff)
+
+
+@dataclass(frozen=True, slots=True)
+class Role:
+    key: str
+    grants: tuple[PermissionGrant, ...] = field(default_factory=tuple)
+    def __post_init__(self) -> None:
+        k = (self.key or '').strip()
+        if not k:
+            raise ValidationError('role key must be non-empty')
+        object.__setattr__(self, 'key', k)
+        object.__setattr__(self, 'grants', tuple(self.grants))
+
+
+@dataclass(frozen=True, slots=True)
+class DirectGrants:
+    allows: tuple[PermType, ...] = field(default_factory=tuple)
+    denies: tuple[PermType, ...] = field(default_factory=tuple)
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'allows', tuple(PermType(validate_permission(str(p))) for p in self.allows))
+        object.__setattr__(self, 'denies', tuple(PermType(validate_permission(str(p))) for p in self.denies))
+
+
+@dataclass(frozen=True, slots=True)
+class Assignment:
+    actor_id: ActorId
+    tenant_id: Optional[TenantId] = None
+    roles: tuple[str, ...] = field(default_factory=tuple)
+    grants: DirectGrants = field(default_factory=DirectGrants)
+    def __post_init__(self) -> None:
+        a = (self.actor_id or '').strip()
+        if not a:
+            raise ValidationError('actor_id must be non-empty')
+        object.__setattr__(self, 'actor_id', ActorId(a))
+        object.__setattr__(self, 'roles', tuple(self.roles))
+
+
+class RBACStore:
+    def __init__(self) -> None:
+        self._roles: Dict[str, Role] = {}
+        self._assign: Dict[tuple[str, Optional[str]], Assignment] = {}
+    # Roles
+    def upsert_role(self, role: Role) -> None:
+        self._roles[role.key] = role
+    def get_role(self, key: str) -> Optional[Role]:
+        return self._roles.get(key)
+    def list_roles(self) -> Sequence[Role]:
+        return tuple(self._roles[k] for k in sorted(self._roles.keys()))
+    # Assignments
+    def upsert_assignment(self, assignment: Assignment) -> None:
+        self._assign[(str(assignment.actor_id), str(assignment.tenant_id) if assignment.tenant_id else None)] = assignment
+    def get_assignments(self, *, actor_id: ActorId, tenant_id: Optional[TenantId]) -> Sequence[Assignment]:
+        out: List[Assignment] = []
+        g = self._assign.get((str(actor_id), None))
+        if g:
+            out.append(g)
+        if tenant_id is not None:
+            t = self._assign.get((str(actor_id), str(tenant_id)))
+            if t:
+                out.append(t)
+        return tuple(out)
+
+
+def _seg_match(grant: tuple[str, ...], need: tuple[str, ...]) -> bool:
+    gi = 0
+    ni = 0
+    while gi < len(grant):
+        g = grant[gi]
+        if g == '*':
+            return True
+        if ni >= len(need):
+            return False
+        if g != need[ni]:
+            return False
+        gi += 1
+        ni += 1
+    return ni == len(need)
+
+
+def _split_perm(p: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    v = validate_permission(p)
+    resource, action = v.split(':', 1)
+    return tuple(resource.split('.')), tuple(action.split('.'))
+
+
+def _perm_match(grant_perm: str, need_perm: str) -> bool:
+    gr, ga = _split_perm(grant_perm)
+    nr, na = _split_perm(need_perm)
+    return _seg_match(gr, nr) and _seg_match(ga, na)
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionResolver:
+    store: RBACStore
+    def has(self, *, actor_id: ActorId, permission: PermType, tenant_id: Optional[TenantId] = None) -> bool:
+        need = PermType(validate_permission(str(permission)))
+        assigns = self.store.get_assignments(actor_id=actor_id, tenant_id=tenant_id)
+        denies: list[PermType] = []
+        allows: list[PermType] = []
+        for a in assigns:
+            denies.extend(a.grants.denies)
+            allows.extend(a.grants.allows)
+            for rk in a.roles:
+                r = self.store.get_role(rk)
+                if not r:
+                    continue
+                for g in r.grants:
+                    if g.effect == 'deny':
+                        denies.append(g.permission)
+                    else:
+                        allows.append(g.permission)
+        if any(_perm_match(str(d), str(need)) for d in denies):
+            return False
+        if any(_perm_match(str(a), str(need)) for a in allows):
+            return True
+        return False
+from __future__ import annotations
+from typing import Optional
+from core.context.request_context import current_context, try_current_context
+from core.time.hlc import HybridLogicalClock
+from core.typing import ActorId, Mode, TenantId, TraceId
+
+# Safe readers
+
+def get_tenant_id() -> TenantId:
+    return current_context().tenant_id
+
+def get_actor_id() -> ActorId:
+    return current_context().actor_id
+
+def get_trace_id() -> TraceId:
+    return current_context().trace_id
+
+def get_mode() -> Mode:
+    return current_context().mode
+
+def get_hlc() -> HybridLogicalClock:
+    return current_context().hlc
+
+# Soft readers
+
+def try_tenant_id() -> Optional[TenantId]:
+    ctx = try_current_context()
+    return ctx.tenant_id if ctx else None
+
+def try_actor_id() -> Optional[ActorId]:
+    ctx = try_current_context()
+    return ctx.actor_id if ctx else None
+
+def try_trace_id() -> Optional[TraceId]:
+    ctx = try_current_context()
+    return ctx.trace_id if ctx else None
+
+def try_mode() -> Optional[Mode]:
+    ctx = try_current_context()
+    return ctx.mode if ctx else None
+
+def try_hlc() -> Optional[HybridLogicalClock]:
+    ctx = try_current_context()
+    return ctx.hlc if ctx else None
+from __future__ import annotations
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
+from dataclasses import replace
+from typing import Any, Dict, Mapping, Optional
+from core.errors import ValidationError, TenantContextMissing
+from core.execution.execution_context import ExecutionContext
+from core.time.hlc import HybridLogicalClock
+from core.typing import Mode
+
+# One ContextVar to rule them all: request-scoped immutable ExecutionContext
+_CTX: ContextVar[Optional[ExecutionContext]] = ContextVar('afh_core_ctx', default=None)
+
+# ---------------------------------------------------------------------------
+# Context lifecycle (set / get / clear)
+# ---------------------------------------------------------------------------
+
+def set_current_context(ctx: ExecutionContext) -> None:
+    if not isinstance(ctx, ExecutionContext):
+        raise ValidationError('ctx must be an ExecutionContext')
+    _CTX.set(ctx)
+
+
+def set_current_context_token(ctx: ExecutionContext) -> Token:
+    if not isinstance(ctx, ExecutionContext):
+        raise ValidationError('ctx must be an ExecutionContext')
+    return _CTX.set(ctx)
+
+
+def current_context() -> ExecutionContext:
+    ctx = _CTX.get()
+    if ctx is None:
+        raise TenantContextMissing('No execution context set.')
+    return ctx
+
+
+def try_current_context() -> Optional[ExecutionContext]:
+    return _CTX.get()
+
+
+def clear_current_context() -> None:
+    _CTX.set(None)
+
+
+@contextmanager
+def use_context(ctx: ExecutionContext):
+    token = set_current_context_token(ctx)
+    try:
+        yield ctx
+    finally:
+        _CTX.reset(token)
+
+# ---------------------------------------------------------------------------
+# Header extraction (zero-trust)
+# ---------------------------------------------------------------------------
+
+def build_context_from_headers(
+    headers: Mapping[str, str],
+    *,
+    actor_fallback: str = 'svc.unknown',
+    default_mode: Mode = 'live',
+) -> ExecutionContext:
+    if not isinstance(headers, Mapping):
+        raise ValidationError('headers must be a mapping')
+    norm = {str(k).strip().lower(): str(v).strip() for k, v in headers.items()}
+    tenant = norm.get('x-tenant') or norm.get('x_tenant') or norm.get('tenant')
+    trace = norm.get('x-trace-id') or norm.get('x_trace_id') or norm.get('trace_id') or norm.get('trace')
+    actor = norm.get('x-actor') or norm.get('x_actor') or norm.get('actor') or actor_fallback
+    mode_raw = norm.get('x-mode') or norm.get('x_mode') or default_mode
+
+    missing = []
+    if not tenant:
+        missing.append('X-Tenant')
+    if not trace:
+        missing.append('X-Trace-Id')
+    if missing:
+        raise ValidationError('Missing required headers', details={'missing': missing})
+
+    ts_raw = norm.get('x-hlc-ts-ms') or norm.get('x_hlc_ts_ms')
+    lg_raw = norm.get('x-hlc-logical') or norm.get('x_hlc_logical')
+
+    if ts_raw is not None and lg_raw is not None:
+        try:
+            rts = int(ts_raw)
+            rlg = int(lg_raw)
+        except Exception:
+            raise ValidationError(
+                'Invalid HLC headers', details={'X-HLC-Ts-Ms': ts_raw, 'X-HLC-Logical': lg_raw}
+            )
+        ctx = ExecutionContext.create(
+            tenant_id=tenant,
+            actor_id=actor,
+            trace_id=trace,
+            mode=str(mode_raw),
+            ms_now=rts,
+        )
+        ctx = replace(ctx, hlc=HybridLogicalClock(rts, rlg))
+    else:
+        ctx = ExecutionContext.create(
+            tenant_id=tenant,
+            actor_id=actor,
+            trace_id=trace,
+            mode=str(mode_raw),
+        )
+    set_current_context(ctx)
+    return ctx
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+def context_snapshot() -> Dict[str, Any]:
+    ctx = try_current_context()
+    if not ctx:
+        return {}
+    return {
+        'tenant_id': str(ctx.tenant_id),
+        'actor_id': str(ctx.actor_id),
+        'trace_id': str(ctx.trace_id),
+        'mode': str(ctx.mode),
+        'hlc': ctx.hlc.to_dict(),
+    }
+from __future__ import annotations
+import os
+import time
+import uuid
+import threading
+from dataclasses import dataclass
+from typing import Optional, Final, Protocol, Callable
+from core.errors import ValidationError
+from core.time.clock import now_ms
+
+# =====================================================================
+# Internal utilities
+# =====================================================================
+
+def _to_hex(n: int, width: int) -> str:
+    return f"{n:0{width}x}"[-width:]
+
+# =====================================================================
+# Monotonic UUIDv7 generator (time-ordered IDs)
+# =====================================================================
+class _UUID7State:
+    """
+    Process-local state for monotonic UUIDv7-like generation.
+    We ensure:
+    - Millisecond timestamp is non-decreasing (uses core.time.clock.now_ms()).
+    - A 12-bit sequence counter increments within the same ms (0..4095).
+    - If the counter overflows within the same ms, we wait for the next millisecond.
+    """
+    __slots__ = ("lock", "last_ms", "seq")
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.last_ms: int = -1
+        self.seq: int = 0
+
+_STATE = _UUID7State()
+
+
+def _next_timestamp_and_seq() -> tuple[int, int]:
+    """Return a (ms, seq12) pair, ensuring strict monotonicity."""
+    with _STATE.lock:
+        ms = now_ms()
+        if ms < _STATE.last_ms:
+            ms = _STATE.last_ms
+        if ms == _STATE.last_ms:
+            _STATE.seq = (_STATE.seq + 1) & 0x0FFF  # 12-bit counter
+            if _STATE.seq == 0:
+                # We exhausted 4096 IDs within the same ms; wait for next ms.
+                while True:
+                    ms_candidate = now_ms()
+                    if ms_candidate > _STATE.last_ms:
+                        ms = ms_candidate
+                        break
+                    time.sleep(0)
+        else:
+            # New millisecond: reset sequence
+            _STATE.seq = 0
+        _STATE.last_ms = ms
+        return ms, _STATE.seq
+
+
+def _uuid_bytes_from_time(ms: int, seq12: int) -> bytes:
+    """
+    Build a 16-byte array with:
+    - First 6 bytes: 48-bit ms (big-endian).
+    - Byte 6: high nibble version=7; low nibble = seq12[11:8].
+    - Byte 7: seq12[7:0].
+    - Byte 8: variant (10xx xxxx) with random low 6 bits.
+    - Bytes 9..15: random.
+    This yields a time-ordered, RFC-4122-variant UUID with version 7 set.
+    """
+    if not (0 <= seq12 <= 0x0FFF):
+        raise ValidationError('seq12 must be in range 0..4095')
+    # Split ms into 6 bytes (48-bit)
+    b0 = (ms >> 40) & 0xFF
+    b1 = (ms >> 32) & 0xFF
+    b2 = (ms >> 24) & 0xFF
+    b3 = (ms >> 16) & 0xFF
+    b4 = (ms >> 8) & 0xFF
+    b5 = ms & 0xFF
+    # Version 7 in high nibble of byte 6; low nibble carries top 4 bits of sequence
+    seq_hi = (seq12 >> 8) & 0x0F
+    b6 = ((0x7 << 4) | seq_hi)
+    # Low 8 bits of sequence in byte 7
+    b7 = seq12 & 0xFF
+    # Variant (RFC4122): top two bits 10xxxxxx; lower 6 bits random
+    r0 = os.urandom(1)[0] & 0x3F  # keep 6 random bits
+    b8 = (0x80 | r0)  # 10xxxxxx
+    # Remaining 7 random bytes
+    tail = os.urandom(7)
+    return bytes([b0, b1, b2, b3, b4, b5, b6, b7, b8]) + tail
+
+
+def uuid7() -> uuid.UUID:
+    """
+    Return a time-ordered UUID (version 7, RFC-4122 variant).
+    Monotonic within process, strictly non-decreasing across calls.
+    """
+    ms, seq12 = _next_timestamp_and_seq()
+    raw = _uuid_bytes_from_time(ms, seq12)
+    return uuid.UUID(bytes=raw)
+
+
+def uuid7_str() -> str:
+    return str(uuid7())
+
+# =====================================================================
+# Standard UUIDv4 and helpers
+# =====================================================================
+
+def uuid4() -> uuid.UUID:
+    return uuid.uuid4()
+
+
+def uuid4_str() -> str:
+    return str(uuid4())
+
+
+def new_id() -> str:
+    """Preferred ID: time-ordered UUIDv7 string."""
+    return uuid7_str()
+
+
+def parse_uuid(value: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value))
+    except Exception as exc:
+        raise ValidationError('invalid UUID string', details={'value': value}) from exc
+
+
+def is_valid_uuid(value: str) -> bool:
+    try:
+        _ = parse_uuid(value)
+        return True
+    except Exception:
+        return False
+
+# =====================================================================
+# Provider protocol and concrete providers
+# =====================================================================
+class UUIDProvider(Protocol):
+    def uuid4(self) -> uuid.UUID: ...
+    def uuid4_str(self) -> str: ...
+    def uuid7(self) -> uuid.UUID: ...
+    def uuid7_str(self) -> str: ...
+    def new_id(self) -> str: ...
+
+
+@dataclass(frozen=True)
+class DefaultUUIDProvider:
+    def uuid4(self) -> uuid.UUID:
+        return uuid4()
+    def uuid4_str(self) -> str:
+        return uuid4_str()
+    def uuid7(self) -> uuid.UUID:
+        return uuid7()
+    def uuid7_str(self) -> str:
+        return uuid7_str()
+    def new_id(self) -> str:
+        return new_id()
+
+
+@dataclass(frozen=True)
+class DeterministicUUIDProvider:
+    """
+    Deterministic provider for tests and reproducible scenarios.
+    - The 'seed' controls the random tail and the variant's low bits.
+    - 'clock_ms' is an optional callable supplying ms; defaults to global now_ms.
+    - Ensures monotonicity by replaying the same sequence logic under a private state.
+    """
+    seed: int
+    start_ms: Optional[int] = None
+    clock_ms: Optional[Callable[[], int]] = None
+
+    def __post_init__(self) -> None:
+        import random
+        object.__setattr__(self, '_rng', random.Random(self.seed))
+        object.__setattr__(self, '_lock', threading.RLock())
+        object.__setattr__(self, '_last_ms', -1 if self.start_ms is None else int(self.start_ms))
+        object.__setattr__(self, '_seq', 0)
+        object.__setattr__(self, '_initialized', self.start_ms is not None)
+
+    def _now(self) -> int:
+        fn = self.clock_ms or now_ms
+        return int(fn())
+
+    def _next_ts_seq(self) -> tuple[int, int]:
+        with self._lock:
+            if not self._initialized:
+                ms = self._now()
+                object.__setattr__(self, '_last_ms', ms)
+                object.__setattr__(self, '_initialized', True)
+            ms = self._now()
+            if ms < self._last_ms:
+                ms = self._last_ms
+            if ms == self._last_ms:
+                self._seq = (self._seq + 1) & 0x0FFF
+                if self._seq == 0:
+                    while True:
+                        ms2 = self._now()
+                        if ms2 > self._last_ms:
+                            ms = ms2
+                            break
+                        time.sleep(0)
+            else:
+                self._seq = 0
+            object.__setattr__(self, '_last_ms', ms)
+            return ms, self._seq
+
+    def _uuid_bytes(self) -> bytes:
+        ms, seq12 = self._next_ts_seq()
+        # 48-bit ms
+        b0 = (ms >> 40) & 0xFF
+        b1 = (ms >> 32) & 0xFF
+        b2 = (ms >> 24) & 0xFF
+        b3 = (ms >> 16) & 0xFF
+        b4 = (ms >> 8) & 0xFF
+        b5 = ms & 0xFF
+        seq_hi = (seq12 >> 8) & 0x0F
+        b6 = ((0x7 << 4) | seq_hi)
+        b7 = seq12 & 0xFF
+        r0 = self._rng.getrandbits(6) & 0x3F
+        b8 = 0x80 | r0
+        tail = bytes(self._rng.getrandbits(8) for _ in range(7))
+        return bytes([b0, b1, b2, b3, b4, b5, b6, b7, b8]) + tail
+
+    def uuid7(self) -> uuid.UUID:
+        return uuid.UUID(bytes=self._uuid_bytes())
+    def uuid7_str(self) -> str:
+        return str(self.uuid7())
+    def uuid4(self) -> uuid.UUID:
+        b = bytearray(self._rng.getrandbits(8) for _ in range(16))
+        b[6] = (b[6] & 0x0F) | (0x4 << 4)  # version 4
+        b[8] = (b[8] & 0x3F) | 0x80        # RFC4122 variant
+        return uuid.UUID(bytes=bytes(b))
+    def uuid4_str(self) -> str:
+        return str(self.uuid4())
+    def new_id(self) -> str:
+        return self.uuid7_str()
+
+DEFAULT_PROVIDER: Final[UUIDProvider] = DefaultUUIDProvider()
+
+__all__ = [
+    'uuid4', 'uuid4_str', 'uuid7', 'uuid7_str', 'new_id',
+    'parse_uuid', 'is_valid_uuid',
+    'UUIDProvider', 'DefaultUUIDProvider', 'DeterministicUUIDProvider',
+    'DEFAULT_PROVIDER',
+]
+from __future__ import annotations
+from dataclasses import replace
+from typing import Mapping, Optional
+from core.errors import ValidationError, TenantIsolationError
+from core.typing import TenantId, JSONObject
+from core.context.request_context import current_context, try_current_context
+from core.tenancy.grammar import validate_slug
+
+
+def current_tenant() -> TenantId:
+    return current_context().tenant_id
+
+
+def try_current_tenant() -> Optional[TenantId]:
+    ctx = try_current_context()
+    return ctx.tenant_id if ctx else None
+
+
+def tenant_from_headers(headers: Mapping[str, str]) -> TenantId:
+    if not isinstance(headers, Mapping):
+        raise ValidationError('headers must be a mapping')
+    norm = {str(k).strip().lower(): str(v).strip() for k, v in headers.items()}
+    raw = norm.get('x-tenant') or norm.get('x_tenant') or norm.get('tenant')
+    if not raw:
+        raise ValidationError('Missing X-Tenant header')
+    return TenantId(validate_slug(raw))
+
+
+def assert_tenant(expected: str | TenantId) -> None:
+    exp = TenantId(validate_slug(str(expected)))
+    cur = current_tenant()
+    if cur != exp:
+        raise TenantIsolationError('Tenant isolation breach', details={'expected': str(exp), 'current': str(cur)})
+
+
+def require_tenant(header_tenant: str | TenantId) -> TenantId:
+    hdr = TenantId(validate_slug(str(header_tenant)))
+    cur = current_tenant()
+    if cur != hdr:
+        raise TenantIsolationError('Tenant mismatch', details={'header': str(hdr), 'context': str(cur)})
+    return hdr
+
+
+def tenant_snapshot() -> JSONObject:
+    ctx = try_current_context()
+    if not ctx:
+        return {}
+    return {'tenant_id': str(ctx.tenant_id), 'mode': str(ctx.mode), 'trace_id': str(ctx.trace_id), 'hlc': ctx.hlc.to_dict()}
+from __future__ import annotations
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Mapping, Any, Optional, Final
+from core.errors import ValidationError
+from core.typing import TenantId, UUIDStr, Millis, JSONObject
+from core.time.clock import now_ms
+from core.identity.uuid import uuid7_str
+from core.tenancy.grammar import validate_slug
+
+_ALLOWED_STATES: Final[tuple[str, ...]] = ('active', 'suspended', 'deleted')
+
+
+def _non_empty_str(name: str, value: str, *, max_len: int) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f'{name} must be a string')
+    v = value.strip()
+    if not v:
+        raise ValidationError(f'{name} must be non-empty')
+    if len(v) > max_len:
+        raise ValidationError(f'{name} too long', details={'max': max_len, 'len': len(v)})
+    return v
+
+
+def _frozen_map(m: Optional[Mapping[str, Any]]) -> Mapping[str, Any]:
+    if m is None:
+        return MappingProxyType({})
+    return MappingProxyType(dict(m))
+
+
+@dataclass(frozen=True, slots=True)
+class Tenant:
+    id: UUIDStr
+    slug: TenantId
+    name: str
+    status: str
+    created_ms: Millis
+    updated_ms: Millis
+    version: int = 0
+    meta: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    features: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    limits: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        slug: str,
+        name: str,
+        status: str = 'active',
+        meta: Optional[Mapping[str, Any]] = None,
+        features: Optional[Mapping[str, Any]] = None,
+        limits: Optional[Mapping[str, Any]] = None,
+        ts_ms: Optional[int] = None,
+        id: Optional[str] = None,
+    ) -> 'Tenant':
+        s = TenantId(validate_slug(slug))
+        nm = _non_empty_str('name', name, max_len=200)
+        st = status.strip().lower()
+        if st not in _ALLOWED_STATES:
+            raise ValidationError('invalid status', details={'status': status, 'allowed': list(_ALLOWED_STATES)})
+        t = Millis(int(ts_ms if ts_ms is not None else now_ms()))
+        return cls(
+            id=UUIDStr(id or uuid7_str()),
+            slug=s,
+            name=nm,
+            status=st,
+            created_ms=t,
+            updated_ms=t,
+            version=0,
+            meta=_frozen_map(meta),
+            features=_frozen_map(features),
+            limits=_frozen_map(limits),
+        )
+
+    def with_update(
+        self,
+        *,
+        name: Optional[str] = None,
+        status: Optional[str] = None,
+        meta: Optional[Mapping[str, Any]] = None,
+        features: Optional[Mapping[str, Any]] = None,
+        limits: Optional[Mapping[str, Any]] = None,
+        ts_ms: Optional[int] = None,
+    ) -> 'Tenant':
+        nm = self.name if name is None else _non_empty_str('name', name, max_len=200)
+        st = self.status if status is None else status.strip().lower()
+        if st not in _ALLOWED_STATES:
+            raise ValidationError('invalid status', details={'status': st, 'allowed': list(_ALLOWED_STATES)})
+        upd = Millis(int(ts_ms if ts_ms is not None else now_ms()))
+        return Tenant(
+            id=self.id,
+            slug=self.slug,
+            name=nm,
+            status=st,
+            created_ms=self.created_ms,
+            updated_ms=upd,
+            version=self.version + 1,
+            meta=_frozen_map(meta) if meta is not None else self.meta,
+            features=_frozen_map(features) if features is not None else self.features,
+            limits=_frozen_map(limits) if limits is not None else self.limits,
+        )
+
+    def to_dict(self) -> JSONObject:
+        return {
+            'id': str(self.id),
+            'slug': str(self.slug),
+            'name': str(self.name),
+            'status': str(self.status),
+            'created_ms': int(self.created_ms),
+            'updated_ms': int(self.updated_ms),
+            'version': int(self.version),
+            'meta': dict(self.meta),
+            'features': dict(self.features),
+            'limits': dict(self.limits),
+        }
+from __future__ import annotations
+import re
+from typing import Final
+from core.errors import ValidationError
+
+# Tenant slug rules (ASCII, lowercase only):
+# - 1..64 chars
+# - allowed: a–z, 0–9, dot (.), hyphen (-)
+# - must not start/end with '.' or '-'
+SLUG_RE: Final[re.Pattern[str]] = re.compile(r'^(?![.-])[a-z0-9][a-z0-9.-]{1,62}[a-z0-9]$', re.ASCII)
+
+
+def normalize_slug(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError('tenant slug must be a string')
+    return value.strip().lower()
+
+
+def is_valid_slug(value: str) -> bool:
+    try:
+        _ = validate_slug(value)
+        return True
+    except Exception:
+        return False
+
+
+def validate_slug(value: str) -> str:
+    v = normalize_slug(value)
+    if not SLUG_RE.match(v):
+        raise ValidationError('invalid tenant slug', details={'slug': value})
+    return v
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Mapping, Optional, Protocol, Tuple, Dict
+from core.typing import TenantId, JSONObject
+from core.errors import ValidationError, TenantIsolationError, NotFoundError
+from core.tenancy.grammar import validate_slug
+from core.context.request_context import try_current_context
+
+@dataclass(frozen=True)
+class ResolveResult:
+    tenant_id: Optional[TenantId]
+    source: Optional[str]
+    confidence: float = 0.0
+    reason: Optional[str] = None
+    details: Optional[JSONObject] = None
+    def to_dict(self) -> JSONObject:
+        return {
+            'tenant_id': self.tenant_id,
+            'source': self.source,
+            'confidence': float(self.confidence),
+            'reason': self.reason,
+            'details': dict(self.details) if isinstance(self.details, dict) else self.details,
+        }
+
+class TenantResolver(Protocol):
+    def resolve(self) -> ResolveResult: ...
+
+
+@dataclass(frozen=True)
+class HeaderTenantResolver:
+    headers: Mapping[str, Any]
+    def resolve(self) -> ResolveResult:
+        if not isinstance(self.headers, Mapping):
+            return ResolveResult(None, 'header', 0.0, 'not_mapping')
+        norm = {str(k).strip().lower(): str(v).strip() for k, v in self.headers.items()}
+        raw = norm.get('x-tenant') or norm.get('x_tenant') or norm.get('tenant')
+        if not raw:
+            return ResolveResult(None, 'header', 0.0, 'missing')
+        try:
+            tid = TenantId(validate_slug(raw))
+            return ResolveResult(tid, 'header:x-tenant', 1.0)
+        except ValidationError as exc:
+            return ResolveResult(None, 'header:x-tenant', 0.0, 'invalid_header', {'error': str(exc)})
+
+
+@dataclass(frozen=True)
+class PathTenantResolver:
+    path_params: Mapping[str, Any]
+    keys: Tuple[str, ...] = ('tenant', 'org')
+    def resolve(self) -> ResolveResult:
+        if not isinstance(self.path_params, Mapping):
+            return ResolveResult(None, 'path', 0.0, 'not_mapping')
+        for k in self.keys:
+            raw = self.path_params.get(k)
+            if raw:
+                try:
+                    tid = TenantId(validate_slug(str(raw)))
+                    return ResolveResult(tid, f'path:{k}', 0.8)
+                except ValidationError as exc:
+                    return ResolveResult(None, f'path:{k}', 0.0, 'invalid_path', {'error': str(exc)})
+        return ResolveResult(None, 'path', 0.0, 'missing')
+
+
+@dataclass(frozen=True)
+class QueryTenantResolver:
+    query_params: Mapping[str, Any]
+    keys: Tuple[str, ...] = ('tenant', 'org')
+    def resolve(self) -> ResolveResult:
+        if not isinstance(self.query_params, Mapping):
+            return ResolveResult(None, 'query', 0.0, 'not_mapping')
+        def first(v: Any) -> Optional[str]:
+            if v is None:
+                return None
+            if isinstance(v, (list, tuple)) and v:
+                return str(v[0]).strip()
+            return str(v).strip()
+        for k in self.keys:
+            raw = first(self.query_params.get(k))
+            if raw:
+                try:
+                    tid = TenantId(validate_slug(raw))
+                    return ResolveResult(tid, f'query:{k}', 0.7)
+                except ValidationError as exc:
+                    return ResolveResult(None, f'query:{k}', 0.0, 'invalid_query', {'error': str(exc)})
+        return ResolveResult(None, 'query', 0.0, 'missing')
+
+
+@dataclass(frozen=True)
+class ContextTenantResolver:
+    def resolve(self) -> ResolveResult:
+        c = try_current_context()
+        if not c:
+            return ResolveResult(None, 'context', 0.0, 'no_context')
+        try:
+            tid = TenantId(validate_slug(str(c.tenant_id)))
+            return ResolveResult(tid, 'context', 0.6)
+        except ValidationError as exc:
+            return ResolveResult(None, 'context', 0.0, 'invalid_context', {'error': str(exc)})
+
+
+@dataclass(frozen=True)
+class CompositeTenantResolver:
+    resolvers: Tuple[TenantResolver, ...]
+    strict: bool = True
+    def resolve(self) -> ResolveResult:
+        chosen: Optional[TenantId] = None
+        first: Optional[str] = None
+        evidence: Dict[str, Any] = {}
+        for r in self.resolvers:
+            res = r.resolve()
+            evidence[res.source or f'r{len(evidence)+1}'] = res.to_dict()
+            if res.tenant_id:
+                if chosen is None:
+                    chosen, first = res.tenant_id, res.source
+                elif res.tenant_id != chosen:
+                    raise TenantIsolationError('Conflicting tenants', details={
+                        'chosen': str(chosen), 'new': str(res.tenant_id), 'first_source': first, 'conflicting_source': res.source, 'evidence': evidence
+                    })
+        if chosen is None:
+            if self.strict:
+                raise NotFoundError('Tenant not resolved', details={'evidence': evidence})
+            return ResolveResult(None, None, 0.0, 'unresolved', evidence)
+        return ResolveResult(chosen, first, 1.0, details=evidence)
+from __future__ import annotations
+import time
+from dataclasses import dataclass, replace
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Literal
+from core.errors import ValidationError
+from core.time.clock import now_ms
+
+HealthStatus = Literal['OK', 'WARN', 'ERROR']
+HealthLevel = Literal['liveness', 'readiness', 'startup', 'diagnostics']
+
+@dataclass(frozen=True, slots=True)
+class HealthCheckResult:
+    name: str
+    level: HealthLevel
+    status: HealthStatus
+    details: Mapping[str, Any]
+    ts_ms: int
+    duration_ms: int
+    critical: bool
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'name': self.name,
+            'level': self.level,
+            'status': self.status,
+            'critical': self.critical,
+            'ts_ms': int(self.ts_ms),
+            'duration_ms': int(self.duration_ms),
+            'details': dict(self.details or {}),
+        }
+
+@dataclass(frozen=True, slots=True)
+class _Entry:
+    name: str
+    level: HealthLevel
+    critical: bool
+    ttl_ms: int
+    fn: Callable[[], Any]
+    cached_at: Optional[int] = None
+    cached: Optional[HealthCheckResult] = None
+
+class HealthRegistry:
+    def __init__(self) -> None:
+        self._items: Dict[str, _Entry] = {}
+
+    def register(self, name: str, fn: Callable[[], Any], *, level: HealthLevel = 'readiness', critical: bool = True, ttl_ms: int = 2000) -> None:
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError('health check name must be non-empty string')
+        if name in self._items:
+            raise ValidationError(f'duplicate health check: {name}')
+        if level not in ('liveness', 'readiness', 'startup', 'diagnostics'):
+            raise ValidationError('invalid health level')
+        if not isinstance(ttl_ms, int) or ttl_ms <= 0:
+            raise ValidationError('ttl_ms must be positive integer')
+        self._items[name] = _Entry(name, level, bool(critical), int(ttl_ms), fn)
+
+    def unregister(self, name: str) -> bool:
+        return self._items.pop(name, None) is not None
+
+    def clear(self) -> None:
+        self._items.clear()
+
+    def run(self, *, level: Optional[HealthLevel] = None, names: Optional[Tuple[str, ...]] = None, fresh: bool = False) -> Dict[str, Any]:
+        selected: Dict[str, _Entry] = {}
+        if names:
+            for n in names:
+                ent = self._items.get(n)
+                if not ent:
+                    raise ValidationError(f'unknown health check: {n}')
+                if level and ent.level != level:
+                    continue
+                selected[n] = ent
+        else:
+            for n, ent in self._items.items():
+                if level and ent.level != level:
+                    continue
+                selected[n] = ent
+        now = int(now_ms())
+        results: Dict[str, HealthCheckResult] = {}
+        for n in sorted(selected.keys()):
+            ent = selected[n]
+            if (not fresh) and ent.cached and ent.cached_at and (now - ent.cached_at) < ent.ttl_ms:
+                results[n] = ent.cached
+                continue
+            t0 = time.perf_counter()
+            try:
+                raw = ent.fn()
+                if isinstance(raw, HealthCheckResult):
+                    res = raw
+                elif isinstance(raw, tuple) and len(raw) == 2:
+                    status_raw, details = raw
+                    status = str(status_raw).upper()
+                    status = status if status in ('OK', 'WARN', 'ERROR') else 'OK'
+                    res = HealthCheckResult(ent.name, ent.level, status, dict(details or {}), now, int((time.perf_counter() - t0) * 1000), ent.critical)
+                elif isinstance(raw, dict):
+                    res = HealthCheckResult(ent.name, ent.level, 'OK', raw, now, int((time.perf_counter() - t0) * 1000), ent.critical)
+                else:
+                    res = HealthCheckResult(ent.name, ent.level, 'OK', {'value': str(raw)}, now, int((time.perf_counter() - t0) * 1000), ent.critical)
+            except Exception as exc:
+                res = HealthCheckResult(ent.name, ent.level, 'ERROR', {'error': type(exc).__name__, 'message': str(exc)[:512]}, now, int((time.perf_counter() - t0) * 1000), ent.critical)
+            ent = replace(ent, cached=res, cached_at=now)
+            self._items[n] = ent
+            results[n] = res
+        overall = 'OK'
+        if any(r.critical and r.status == 'ERROR' for r in results.values()):
+            overall = 'ERROR'
+        elif any(r.critical and r.status == 'WARN' for r in results.values()):
+            overall = 'WARN'
+        return {'ts_ms': now, 'status': overall, 'checks': [results[k].to_dict() for k in sorted(results.keys())]}
+from __future__ import annotations
+from core.health.registry import HealthRegistry, HealthCheckResult
+from core.time.clock import now_ms, clock_info
+from core.kernel.freeze import is_kernel_frozen
+from core.registry.services import resolved_snapshot
+
+reg = HealthRegistry()
+
+def check_liveness() -> HealthCheckResult:
+    return HealthCheckResult(
+        name='core.liveness', level='liveness', status='OK', details={'ts_ms': int(now_ms())}, ts_ms=int(now_ms()), duration_ms=0, critical=False
+    )
+
+
+def check_kernel():
+    frozen = bool(is_kernel_frozen())
+    status = 'OK' if frozen else 'WARN'
+    return (status, {'kernel_frozen': frozen, 'clock': clock_info(), 'services_resolved': resolved_snapshot()})
+
+reg.register('core.liveness', check_liveness, level='liveness', critical=False, ttl_ms=1000)
+reg.register('core.kernel', check_kernel, level='readiness', critical=True, ttl_ms=3000)
+from __future__ import annotations
+from typing import Optional, Protocol
+from core.errors import ValidationError, ConflictError
+from core.saga.state import SagaState
+from core.events.event import Event
+
+class SagaStorage(Protocol):
+    def load(self, saga_id: str) -> Optional[SagaState]: ...
+    def save(self, state: SagaState) -> None: ...
+    def try_save(self, state: SagaState, expected_version: int) -> bool: ...
+
+class SagaDefinition(Protocol):
+    saga_type: str
+    def initial_state(self, *, saga_id: str, tenant_id: str, event: Event) -> SagaState: ...
+    def handle(self, state: SagaState, event: Event) -> SagaState: ...
+
+class SagaManager:
+    def __init__(self, storage: SagaStorage) -> None:
+        self._storage = storage
+        self._defs: dict[str, SagaDefinition] = {}
+
+    def register(self, definition: SagaDefinition) -> None:
+        if not getattr(definition, 'saga_type', None):
+            raise ValidationError("Invalid saga definition (missing 'saga_type')")
+        self._defs[definition.saga_type] = definition
+
+    def handle_event(self, *, saga_id: str, saga_type: str, tenant_id: str, event: Event, use_optimistic_concurrency: bool = True) -> SagaState:
+        if not saga_id.strip():
+            raise ValidationError('saga_id must be non-empty')
+        if not saga_type.strip():
+            raise ValidationError('saga_type must be non-empty')
+        if not tenant_id.strip():
+            raise ValidationError('tenant_id must be non-empty')
+        d = self._defs.get(saga_type)
+        if not d:
+            raise ValidationError(f'Saga type not registered: {saga_type}')
+        current = self._storage.load(saga_id)
+        if current is None:
+            current = d.initial_state(saga_id=saga_id, tenant_id=tenant_id, event=event)
+            self._storage.save(current)
+        new_state = d.handle(current, event)
+        if new_state.version <= current.version:
+            new_state = SagaState(
+                saga_id=new_state.saga_id,
+                saga_type=new_state.saga_type,
+                tenant_id=new_state.tenant_id,
+                status=new_state.status,
+                data=new_state.data,
+                version=current.version + 1,
+                processed_event_ids=new_state.processed_event_ids,
+            )
+        if use_optimistic_concurrency and hasattr(self._storage, 'try_save'):
+            ok = self._storage.try_save(new_state, expected_version=current.version)
+            if not ok:
+                raise ConflictError('Saga concurrent modification', details={'saga_id': saga_id, 'expected': current.version})
+        else:
+            self._storage.save(new_state)
+        return new_state
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Mapping, Tuple
+
+@dataclass(frozen=True, slots=True)
+class SagaState:
+    saga_id: str
+    saga_type: str
+    tenant_id: str
+    status: str
+    data: Mapping[str, Any]
+    version: int = 0
+    processed_event_ids: Tuple[str, ...] = ()
+
+    def with_update(self, *, status: str | None = None, data: Mapping[str, Any] | None = None, append_event_id: str | None = None, keep_last_n_ids: int = 1024) -> 'SagaState':
+        new_status = status or self.status
+        merged = dict(self.data)
+        if data:
+            merged.update(data)
+        proc = list(self.processed_event_ids)
+        if append_event_id and append_event_id not in proc:
+            proc.append(append_event_id)
+        if keep_last_n_ids > 0 and len(proc) > keep_last_n_ids:
+            proc = proc[-keep_last_n_ids:]
+        return SagaState(
+            saga_id=self.saga_id,
+            saga_type=self.saga_type,
+            tenant_id=self.tenant_id,
+            status=new_status,
+            data=merged,
+            version=self.version + 1,
+            processed_event_ids=tuple(proc),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            'saga_id': self.saga_id,
+            'saga_type': self.saga_type,
+            'tenant_id': self.tenant_id,
+            'status': self.status,
+            'version': int(self.version),
+            'data': dict(self.data),
+            'processed_event_ids': list(self.processed_event_ids),
+        }
+from __future__ import annotations
+from datetime import datetime, timezone, timedelta
+from threading import RLock
+from typing import Protocol, Optional, Dict, Any, Final
+from core.errors import KernelError, ValidationError
+
+# ---------------------------------------------------------------------
+# Contracts
+# ---------------------------------------------------------------------
+class Clock(Protocol):
+    """Minimal clock protocol: return a timezone-aware UTC datetime."""
+    def now(self) -> datetime: ...
+
+
+def _ensure_aware_utc(dt: datetime) -> datetime:
+    if not isinstance(dt, datetime):
+        raise KernelError('Clock returned a non-datetime object')
+    if dt.tzinfo is None:
+        raise KernelError('Clock must return a timezone-aware datetime')
+    return dt.astimezone(timezone.utc)
+
+# ---------------------------------------------------------------------
+# Concrete clocks
+# ---------------------------------------------------------------------
+class SystemClock:
+    """Wall clock source: host system time in UTC."""
+    def now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+
+class FixedClock:
+    """Deterministic, fixed timestamp (good for tests and reproducibility)."""
+    def __init__(self, fixed_time: datetime):
+        self._t = _ensure_aware_utc(fixed_time)
+    def now(self) -> datetime:
+        return self._t
+
+
+class IncrementalClock:
+    """
+    Deterministic step clock.
+    Each call to now() advances by 'step' from the last emitted timestamp.
+    """
+    def __init__(self, start: datetime, step: timedelta):
+        self._cur = _ensure_aware_utc(start)
+        if not isinstance(step, timedelta) or step.total_seconds() <= 0:
+            raise ValidationError('step must be a positive timedelta')
+        self._step = step
+        self._lock = RLock()
+    def now(self) -> datetime:
+        with self._lock:
+            out = self._cur
+            self._cur = self._cur + self._step
+            return out
+
+
+class OffsetClock:
+    """Wrap any clock and add a constant offset (positive or negative)."""
+    def __init__(self, base: Clock, offset: timedelta):
+        self._base = base
+        if not isinstance(offset, timedelta):
+            raise ValidationError('offset must be a timedelta')
+        self._offset = offset
+    def now(self) -> datetime:
+        return _ensure_aware_utc(self._base.now()) + self._offset
+
+
+class MonotonicClock:
+    """
+    Enforces non-decreasing timestamps on top of an arbitrary base clock.
+    If base returns a time that is behind the last emitted, we clamp to last.
+    """
+    def __init__(self, base: Clock):
+        self._base = base
+        self._last: Optional[datetime] = None
+        self._lock = RLock()
+    def now(self) -> datetime:
+        with self._lock:
+            cur = _ensure_aware_utc(self._base.now())
+            if self._last is None or cur >= self._last:
+                self._last = cur
+            # If base went backwards, we clamp to _last
+            return self._last
+
+# ---------------------------------------------------------------------
+# Global clock registry (thread-safe and monotonic by default)
+# ---------------------------------------------------------------------
+_global_clock: Clock = MonotonicClock(SystemClock())
+_lock: Final[RLock] = RLock()
+
+
+def set_clock(clock: Clock, *, enforce_monotonic: bool = True, warmup_check: bool = True) -> None:
+    """
+    Install a new global clock.
+    - Wraps with MonotonicClock by default for safety.
+    - 'warmup_check' ensures the new clock returns tz-aware UTC.
+    NOTE: This function is intentionally policy-agnostic; callers should invoke it during bootstrap.
+    """
+    global _global_clock
+    if not hasattr(clock, 'now'):
+        raise KernelError('Clock must implement now()')
+    with _lock:
+        candidate: Clock = MonotonicClock(clock) if enforce_monotonic else clock
+        if warmup_check:
+            probe = candidate.now()
+            _ensure_aware_utc(probe)
+        _global_clock = candidate
+
+
+def get_clock() -> Clock:
+    with _lock:
+        return _global_clock
+
+
+def now() -> datetime:
+    """Return the current time as tz-aware UTC datetime (monotonic non-decreasing)."""
+    with _lock:
+        return _global_clock.now()
+
+
+def now_ms() -> int:
+    """Milliseconds since Unix epoch (derived from now())."""
+    return int(now().timestamp() * 1000)
+
+
+def to_ms(dt: datetime) -> int:
+    """
+    Convert a tz-aware datetime to epoch milliseconds.
+    Raises if naive.
+    """
+    dt_utc = _ensure_aware_utc(dt)
+    return int(dt_utc.timestamp() * 1000)
+
+
+def from_ms(ms: int) -> datetime:
+    """Convert epoch milliseconds to tz-aware UTC datetime."""
+    if not isinstance(ms, int) or ms < 0:
+        raise ValidationError('ms must be a non-negative int')
+    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+
+
+def clock_info() -> Dict[str, Any]:
+    """Small diagnostic snapshot of the global clock."""
+    with _lock:
+        return {
+            'type': type(_global_clock).__name__,
+            'monotonic_wrapper': isinstance(_global_clock, MonotonicClock),
+        }
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+from core.errors import ValidationError
+from core.time.clock import now_ms
+
+@dataclass(frozen=True, slots=True)
+class HybridLogicalClock:
+    """
+    Hybrid Logical Clock (HLC) with (wall_ms, logical) components.
+    Invariants:
+    - wall_ms is epoch milliseconds (int >= 0)
+    - logical is an int >= 0
+    - tick() never goes backwards; merge() selects the max wall and
+      adjusts logical according to standard HLC rules.
+    """
+    wall_ms: int
+    logical: int = 0
+
+    # -------------------- construction --------------------
+    @staticmethod
+    def _norm_ms(ms: int) -> int:
+        if not isinstance(ms, int) or ms < 0:
+            raise ValidationError('wall_ms must be a non-negative int')
+        return ms
+
+    @staticmethod
+    def _norm_logical(l: int) -> int:
+        if not isinstance(l, int) or l < 0:
+            raise ValidationError('logical must be a non-negative int')
+        return l
+
+    @classmethod
+    def initial(cls, *, ms: Optional[int] = None) -> 'HybridLogicalClock':
+        """Construct an initial HLC from now() or a supplied ms value."""
+        t = int(ms if ms is not None else now_ms())
+        return cls(cls._norm_ms(t), 0)
+
+    # -------------------- operations --------------------
+    def tick(self, *, ms_now: Optional[int] = None) -> 'HybridLogicalClock':
+        """
+        Local tick on an event.
+        If the current wall is behind a fresh now(), advance wall and reset logical = 0.
+        Otherwise (same or future wall), increment logical.
+        """
+        cur = int(ms_now if ms_now is not None else now_ms())
+        cur = self._norm_ms(cur)
+        if cur > self.wall_ms:
+            return HybridLogicalClock(cur, 0)
+        return HybridLogicalClock(self.wall_ms, self.logical + 1)
+
+    def merge(
+        self,
+        *,
+        remote_wall_ms: int,
+        remote_logical: int,
+        ms_now: Optional[int] = None,
+    ) -> 'HybridLogicalClock':
+        """
+        Merge with a remote HLC observed in a message.
+        Takes the maximum of local wall, remote wall, and now(),
+        then sets logical as per the standard HLC merge.
+        """
+        rw = self._norm_ms(int(remote_wall_ms))
+        rl = self._norm_logical(int(remote_logical))
+        cur = self._norm_ms(int(ms_now if ms_now is not None else now_ms()))
+        wall = max(self.wall_ms, rw, cur)
+        if wall == self.wall_ms == rw:
+            logical = max(self.logical, rl) + 1
+        elif wall == self.wall_ms:
+            logical = self.logical + 1
+        elif wall == rw:
+            logical = rl + 1
+        else:
+            logical = 0
+        return HybridLogicalClock(wall, logical)
+
+    # -------------------- utilities --------------------
+    def to_tuple(self) -> Tuple[int, int]:
+        return (int(self.wall_ms), int(self.logical))
+
+    def to_dict(self) -> Dict[str, int]:
+        return {'ts_ms': int(self.wall_ms), 'logical': int(self.logical)}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, int]) -> 'HybridLogicalClock':
+        try:
+            return cls(
+                cls._norm_ms(int(data['ts_ms'])),
+                cls._norm_logical(int(data['logical']))
+            )
+        except Exception as exc:
+            raise ValidationError('invalid HLC dict', details={'data': dict(data)}) from exc
+
+    def happens_before(self, other: 'HybridLogicalClock') -> bool:
+        if self.wall_ms < other.wall_ms:
+            return True
+        if self.wall_ms == other.wall_ms and self.logical < other.logical:
+            return True
+        return False
+
+    def concurrent_with(self, other: 'HybridLogicalClock') -> bool:
+        return not self.happens_before(other) and not other.happens_before(self)
+from __future__ import annotations
+from typing import (
+    Any,
+    Dict,
+    Mapping,
+    MutableMapping,
+    NewType,
+    Sequence,
+    Tuple,
+    Union,
+    Literal,
+    Final,
+    Protocol,
+    Optional,
+)
+
+# ---------------------------------------------------------------------
+# Stable ID aliases (readability + type safety)
+# ---------------------------------------------------------------------
+TenantId = NewType('TenantId', str)
+ActorId = NewType('ActorId', str)
+TraceId = NewType('TraceId', str)
+UUIDStr = NewType('UUIDStr', str)
+IdempotencyKey = NewType('IdempotencyKey', str)
+
+# Time units
+Millis = NewType('Millis', int)  # epoch millis
+Seconds = NewType('Seconds', int)  # optional helper for health/ttl if needed
+
+# RBAC / Permission / Topics
+Permission = NewType('Permission', str)
+EventType = NewType('EventType', str)
+TopicName = NewType('TopicName', str)
+
+# ---------------------------------------------------------------------
+# Execution mode (strict write guard depends on this Literal)
+# ---------------------------------------------------------------------
+Mode = Literal['live', 'replay', 'dry_run']
+DEFAULT_MODE: Final[Mode] = 'live'
+
+# ---------------------------------------------------------------------
+# JSON-like structural types (for payloads and details)
+# These are intentionally permissive but recursively defined to stay JSON-safe.
+# ---------------------------------------------------------------------
+JSONScalar = Union[str, int, float, bool, None]
+JSONValue = Union[JSONScalar, 'JSONArray', 'JSONObject']
+JSONArray = Sequence[JSONValue]
+JSONObject = Dict[str, JSONValue]
+
+# Read-only and mutable mappings for convenience in signatures
+ReadonlyJSON = Mapping[str, JSONValue]
+MutableJSON = MutableMapping[str, JSONValue]
+
+# Canonical header value constraints used by events/outbox
+HeaderScalar = Union[str, int, float, None]
+ReadonlyHeaders = Mapping[str, HeaderScalar]
+MutableHeaders = Dict[str, HeaderScalar]
+
+# Outbox convenience shapes (missing in original)
+OutboxHeaders = ReadonlyHeaders
+OutboxRecordShape = Dict[str, JSONValue]
+
+# ---------------------------------------------------------------------
+# Common protocols (non-invasive duck typing across modules)
+# ---------------------------------------------------------------------
+class SupportsToDict(Protocol):
+    def to_dict(self) -> Dict[str, Any]:  # pragma: no cover (behavioral contract)
+        ...
+
+
+class SupportsNowMillis(Protocol):
+    def now_ms(self) -> int:  # pragma: no cover
+        ...
+
+# ---------------------------------------------------------------------
+# Helper aliases frequently used in core
+# ---------------------------------------------------------------------
+JSONMap = JSONObject
+Headers = ReadonlyHeaders
+
+__all__ = [
+    # ids
+    'TenantId',
+    'ActorId',
+    'TraceId',
+    'UUIDStr',
+    'IdempotencyKey',
+    # time
+    'Millis',
+    'Seconds',
+    # rbac/events
+    'Permission',
+    'EventType',
+    'TopicName',
+    # exec mode
+    'Mode',
+    'DEFAULT_MODE',
+    # json / headers
+    'JSONScalar',
+    'JSONValue',
+    'JSONArray',
+    'JSONObject',
+    'ReadonlyJSON',
+    'MutableJSON',
+    'HeaderScalar',
+    'ReadonlyHeaders',
+    'MutableHeaders',
+    'OutboxHeaders',
+    'OutboxRecordShape',
+    # protocols
+    'SupportsToDict',
+    'SupportsNowMillis',
+    # convenience
+    'JSONMap',
+    'Headers',
+]
+from __future__ import annotations
+from typing import Protocol, Optional, Sequence
+from core.audit.audit_record import AuditRecord
+
+class AuditStorage(Protocol):
+    def save(self, rec: AuditRecord) -> None: ...
+    def get(self, id: str) -> Optional[AuditRecord]: ...
+    def list(self, *, tenant_id: Optional[str] = None, limit: int = 100) -> Sequence[AuditRecord]: ...
+from __future__ import annotations
+import hashlib
+from dataclasses import dataclass
+from typing import Final, Sequence, Tuple
+from core.errors import ValidationError
+from core.audit.audit_record import AuditRecord
+
+_LEAF_TAG: Final[bytes] = b"\x00"
+_NODE_TAG: Final[bytes] = b"\x01"
+_HEX_LEN: Final[int] = 64
+
+
+def _sha256_hex(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def _is_hex_256(h: str) -> bool:
+    if not isinstance(h, str) or len(h) != _HEX_LEN:
+        return False
+    try:
+        int(h, 16)
+        return True
+    except Exception:
+        return False
+
+
+def merkle_leaf_from_record(record: AuditRecord) -> str:
+    if not record.hash or not _is_hex_256(record.hash):
+        raise ValidationError('AuditRecord.hash must be a 64-char hex string')
+    return _sha256_hex(_LEAF_TAG + bytes.fromhex(record.hash))
+
+
+def merkle_parent(left_hex: str, right_hex: str) -> str:
+    if not (_is_hex_256(left_hex) and _is_hex_256(right_hex)):
+        raise ValidationError('left/right must be 64-char hex strings')
+    return _sha256_hex(_NODE_TAG + bytes.fromhex(left_hex) + bytes.fromhex(right_hex))
+
+
+@dataclass(frozen=True, slots=True)
+class MerkleTree:
+    levels: Tuple[Tuple[str, ...], ...]
+    duplicate_last: bool = True
+    @property
+    def root(self) -> str:
+        return self.levels[-1][0] if self.levels and self.levels[-1] else ''
+    @staticmethod
+    def build(leaves: Sequence[str], *, duplicate_last: bool = True) -> 'MerkleTree':
+        if not leaves:
+            return MerkleTree(((),), duplicate_last)
+        for h in leaves:
+            if not _is_hex_256(h):
+                raise ValidationError('leaf must be 64-char hex string')
+        level = tuple(leaves)
+        levels = [level]
+        while len(level) > 1:
+            nxt = []
+            i = 0
+            L = len(level)
+            while i < L:
+                left = level[i]
+                right = level[i + 1] if i + 1 < L else (left if duplicate_last else left)
+                nxt.append(merkle_parent(left, right))
+                i += 2
+            level = tuple(nxt)
+            levels.append(level)
+        return MerkleTree(tuple(levels), duplicate_last)
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Mapping, Any
+from core.audit.audit_record import AuditRecord
+from core.typing import TenantId
+
+@dataclass(frozen=True)
+class AuditWriter:
+    def write(self, *, tenant_id: str, topic: str, payload: Mapping[str, Any], ts_ms: int | None = None, id: str | None = None) -> AuditRecord:
+        return AuditRecord.build(tenant_id=TenantId(tenant_id), topic=topic, payload=payload, ts_ms=ts_ms, id=id)
+from __future__ import annotations
+import json
+import hashlib
+from dataclasses import dataclass
+from typing import Any, Mapping
+from core.errors import ValidationError
+from core.identity.uuid import uuid7_str
+from core.time.clock import now_ms
+from core.typing import JSONObject, TenantId
+
+
+def _to_canonical_json_bytes(obj: Any) -> bytes:
+    try:
+        s = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError('payload is not JSON-serializable', details={'error': str(exc)}) from exc
+    return s.encode('utf-8')
+
+
+def compute_payload_hash_hex(payload: Mapping[str, Any]) -> str:
+    data = _to_canonical_json_bytes(payload)
+    return hashlib.sha256(data).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class AuditRecord:
+    id: str
+    ts_ms: int
+    tenant_id: str
+    topic: str
+    payload: Mapping[str, Any]
+    hash: str
+    def to_dict(self) -> JSONObject:
+        return {
+            'id': self.id,
+            'ts_ms': int(self.ts_ms),
+            'tenant_id': self.tenant_id,
+            'topic': self.topic,
+            'payload': dict(self.payload),
+            'hash': self.hash,
+        }
+    @staticmethod
+    def build(*, tenant_id: str, topic: str, payload: Mapping[str, Any], ts_ms: int | None = None, id: str | None = None) -> 'AuditRecord':
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ValidationError('tenant_id must be a non-empty string')
+        if not isinstance(topic, str) or not topic.strip():
+            raise ValidationError('topic must be a non-empty string')
+        if not isinstance(payload, Mapping):
+            raise ValidationError('payload must be a mapping')
+        p_hash = compute_payload_hash_hex(payload)
+        return AuditRecord(
+            id=id or uuid7_str(),
+            ts_ms=int(ts_ms if ts_ms is not None else now_ms()),
+            tenant_id=TenantId(tenant_id),
+            topic=str(topic).strip().lower(),
+            payload=payload,
+            hash=p_hash,
+        )
+from __future__ import annotations
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Callable, List, Literal, Optional
+from core.time.clock import now_ms
+
+TxnStatus = Literal['active', 'committed', 'rolled_back']
+
+@dataclass(frozen=True)
+class TxnSnapshot:
+    id: int
+    status: TxnStatus
+    began_ms: int
+    ended_ms: Optional[int]
+
+
+class TransactionManager:
+    def __init__(self) -> None:
+        self._stack: ContextVar[List[int]] = ContextVar('afh_txn_stack', default=[])
+        self._log: List[TxnSnapshot] = []
+        self._next_id = 1
+        self._post_commit: ContextVar[List[Callable[[], None]]] = ContextVar('afh_txn_post_commit', default=[])
+
+    def begin(self) -> int:
+        tid = self._next_id
+        self._next_id += 1
+        stack = list(self._stack.get())
+        stack.append(tid)
+        self._stack.set(stack)
+        self._log.append(TxnSnapshot(tid, 'active', now_ms(), None))
+        return tid
+
+    def commit(self) -> None:
+        stack = list(self._stack.get())
+        if not stack:
+            return
+        tid = stack.pop()
+        self._stack.set(stack)
+        for i in range(len(self._log) - 1, -1, -1):
+            s = self._log[i]
+            if s.id == tid and s.status == 'active':
+                self._log[i] = TxnSnapshot(s.id, 'committed', s.began_ms, now_ms())
+                break
+        if not stack:
+            cbs = list(self._post_commit.get())
+            self._post_commit.set([])
+            for cb in cbs:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+    def rollback(self) -> None:
+        stack = list(self._stack.get())
+        if not stack:
+            return
+        tid = stack.pop()
+        self._stack.set(stack)
+        for i in range(len(self._log) - 1, -1, -1):
+            s = self._log[i]
+            if s.id == tid and s.status == 'active':
+                self._log[i] = TxnSnapshot(s.id, 'rolled_back', s.began_ms, now_ms())
+                break
+        if not stack:
+            self._post_commit.set([])
+
+    def add_post_commit(self, fn: Callable[[], None]) -> None:
+        if not self._stack.get():
+            return
+        cbs = list(self._post_commit.get())
+        cbs.append(fn)
+        self._post_commit.set(cbs)
+
+    def snapshot(self) -> list[dict]:
+        out: list[dict] = []
+        for s in self._log:
+            out.append({
+                'id': int(s.id),
+                'status': str(s.status),
+                'began_ms': int(s.began_ms),
+                'ended_ms': int(s.ended_ms) if s.ended_ms is not None else None,
+            })
+        return out
+
+
+_TM = TransactionManager()
+
+@contextmanager
+def transaction():
+    tid = _TM.begin()
+    try:
+        yield _TM
+        _TM.commit()
+    except Exception:
+        _TM.rollback()
+        raise
+from __future__ import annotations
+from functools import wraps
+from typing import Callable, TypeVar, ParamSpec
+from core.errors import StrictWriteViolation
+from core.typing import Mode
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+
+def assert_writable(mode: Mode) -> None:
+    if mode in ('replay', 'dry_run'):
+        raise StrictWriteViolation(f'Writes forbidden in mode={mode}')
+
+
+def require_live_mode(fn: Callable[P, R]) -> Callable[P, R]:
+    @wraps(fn)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        mode: Mode | None = None
+        if 'mode' in kwargs:
+            mode = kwargs['mode']  # type: ignore[assignment]
+        elif args:
+            last = args[-1]
+            if isinstance(last, str):
+                mode = last  # type: ignore[assignment]
+        if mode is None:
+            return fn(*args, **kwargs)
+        assert_writable(mode)
+        return fn(*args, **kwargs)
+    return wrapper
+from __future__ import annotations
+import re
+from dataclasses import dataclass, replace, field
+from typing import Final, Pattern, Optional
+from core.errors import ValidationError, StrictWriteViolation
+from core.time.hlc import HybridLogicalClock
+from core.typing import TenantId, ActorId, TraceId, Mode, JSONObject
+
+# Validation constraints
+_TOKEN_RE: Final[Pattern[str]] = re.compile(r'^[A-Za-z0-9._:-]+$')
+MAX_TENANT_LEN: Final[int] = 64
+MAX_ACTOR_LEN: Final[int] = 128
+MAX_TRACE_LEN: Final[int] = 128
+_ALLOWED_MODES: Final[tuple[Mode, ...]] = ('live', 'replay', 'dry_run')
+
+
+def _sanitize_token(name: str, value: str, max_len: int) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f'{name} must be a string', details={'field': name})
+    v = value.strip()
+    if not v:
+        raise ValidationError(f'{name} must be non-empty', details={'field': name})
+    if len(v) > max_len:
+        raise ValidationError(f'{name} too long', details={'field': name, 'max': max_len, 'len': len(v)})
+    if not _TOKEN_RE.match(v):
+        raise ValidationError(f'{name} contains invalid characters', details={'field': name, 'allowed': 'A-Za-z0-9._:-'})
+    return v
+
+
+def _validate_mode(mode: str) -> Mode:
+    m = str(mode).strip().lower()
+    if m not in _ALLOWED_MODES:
+        raise ValidationError('Invalid execution mode', details={'mode': m, 'allowed': list(_ALLOWED_MODES)})
+    return m  # type: ignore[return-value]
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionContext:
+    tenant_id: TenantId
+    actor_id: ActorId
+    trace_id: TraceId
+    mode: Mode = 'live'
+    hlc: HybridLogicalClock = field(default_factory=HybridLogicalClock.initial)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        tenant_id: str,
+        actor_id: str,
+        trace_id: str,
+        mode: str = 'live',
+        ms_now: Optional[int] = None,
+    ) -> 'ExecutionContext':
+        tnt = _sanitize_token('tenant_id', tenant_id, MAX_TENANT_LEN)
+        act = _sanitize_token('actor_id', actor_id, MAX_ACTOR_LEN)
+        trc = _sanitize_token('trace_id', trace_id, MAX_TRACE_LEN)
+        md = _validate_mode(mode)
+        hlc = HybridLogicalClock.initial(ms=ms_now)
+        return cls(TenantId(tnt), ActorId(act), TraceId(trc), md, hlc)
+
+    def assert_writable(self) -> None:
+        if self.mode in ('replay', 'dry_run'):
+            raise StrictWriteViolation(f'Writes forbidden in mode={self.mode}')
+
+    def tick(self, *, ms_now: Optional[int] = None) -> 'ExecutionContext':
+        return replace(self, hlc=self.hlc.tick(ms_now=ms_now))
+
+    def merge_remote(self, *, remote_ts_ms: int, remote_logical: int, ms_now: Optional[int] = None) -> 'ExecutionContext':
+        merged = self.hlc.merge(remote_wall_ms=remote_ts_ms, remote_logical=remote_logical, ms_now=ms_now)
+        return replace(self, hlc=merged)
+
+    def with_mode(self, mode: str) -> 'ExecutionContext':
+        return replace(self, mode=_validate_mode(mode))
+
+    def with_actor(self, actor_id: str) -> 'ExecutionContext':
+        return replace(self, actor_id=ActorId(_sanitize_token('actor_id', actor_id, MAX_ACTOR_LEN)))
+
+    def with_trace(self, trace_id: str) -> 'ExecutionContext':
+        return replace(self, trace_id=TraceId(_sanitize_token('trace_id', trace_id, MAX_TRACE_LEN)))
+
+    def with_tenant(self, tenant_id: str) -> 'ExecutionContext':
+        return replace(self, tenant_id=TenantId(_sanitize_token('tenant_id', tenant_id, MAX_TENANT_LEN)))
+
+    def to_dict(self) -> JSONObject:
+        return {
+            'tenant_id': str(self.tenant_id),
+            'actor_id': str(self.actor_id),
+            'trace_id': str(self.trace_id),
+            'mode': str(self.mode),
+            'hlc': self.hlc.to_dict(),
+        }
+from __future__ import annotations
+import threading
+from functools import wraps
+from typing import Any, Callable, ParamSpec, TypeVar
+from core.errors import ValidationError
+from core.registry.registry import Registry
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+SERVICES: Registry[str, Any] = Registry()
+_instances: dict[str, Any] = {}
+_lock = threading.RLock()
+
+def register_service(key: str, obj_or_factory: Any) -> None:
+    if callable(obj_or_factory):
+        if getattr(obj_or_factory, '__code__', None) and obj_or_factory.__code__.co_argcount != 0:  # type: ignore[attr-defined]
+            raise ValidationError('service factory must be a zero-arg callable', details={'key': key, 'argcount': getattr(obj_or_factory, '__code__', None)})
+    SERVICES.register(key, obj_or_factory)
+
+
+def service(key: str) -> Callable[[Callable[[], R]], Callable[[], R]]:
+    def deco(fn: Callable[[], R]) -> Callable[[], R]:
+        if not callable(fn):
+            raise ValidationError('service must be callable', details={'key': key})
+        if fn.__code__.co_argcount != 0:  # type: ignore[attr-defined]
+            raise ValidationError('service factory must be zero-arg', details={'key': key})
+        register_service(key, fn)
+        @wraps(fn)
+        def wrapped() -> R:
+            return fn()
+        return wrapped
+    return deco
+
+
+def _resolve(key: str, value: Any) -> Any:
+    if not callable(value):
+        return value
+    with _lock:
+        if key in _instances:
+            return _instances[key]
+        instance = value()
+        _instances[key] = instance
+        return instance
+
+
+def get_service(key: str) -> Any:
+    value = SERVICES.require(key)
+    return _resolve(key, value)
+
+
+def try_get_service(key: str, default: Any | None = None) -> Any:
+    value = SERVICES.get(key)
+    if value is None:
+        return default
+    return _resolve(key, value)
+
+
+def replace_service(key: str, obj_or_factory: Any) -> None:
+    if callable(obj_or_factory):
+        if getattr(obj_or_factory, '__code__', None) and obj_or_factory.__code__.co_argcount != 0:  # type: ignore[attr-defined]
+            raise ValidationError('service factory must be zero-arg', details={'key': key, 'argcount': getattr(obj_or_factory, '__code__', None)})
+    with _lock:
+        _instances.pop(key, None)
+    SERVICES.replace(key, obj_or_factory)
+
+
+def resolved_snapshot() -> dict[str, str]:
+    with _lock:
+        return {k: type(v).__name__ for k, v in sorted(_instances.items())}
+from __future__ import annotations
+import threading
+from typing import Any, Dict, Mapping, Optional, Tuple, TypeVar, Generic
+from core.errors import ValidationError, NotFoundError
+from core.kernel.freeze import assert_kernel_mutable
+
+K = TypeVar('K', bound=str)
+V = TypeVar('V')
+
+class Registry(Generic[K, V]):
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._items: Dict[K, V] = {}
+
+    @staticmethod
+    def _norm_key(key: K) -> K:
+        if not isinstance(key, str):
+            raise ValidationError('key must be a string', details={'type': type(key).__name__})
+        k = key.strip()
+        if not k:
+            raise ValidationError('key must be non-empty')
+        return k  # type: ignore[return-value]
+
+    def register(self, key: K, item: V) -> None:
+        k = self._norm_key(key)
+        with self._lock:
+            assert_kernel_mutable()
+            if k in self._items:
+                raise ValidationError('duplicate key', details={'key': k})
+            self._items[k] = item
+
+    def register_many(self, mapping: Mapping[K, V], *, overwrite: bool = False) -> None:
+        if not isinstance(mapping, Mapping):
+            raise ValidationError('mapping must be a Mapping')
+        items = {self._norm_key(k): v for k, v in mapping.items()}
+        with self._lock:
+            assert_kernel_mutable()
+            if not overwrite:
+                dups = [k for k in items.keys() if k in self._items]
+                if dups:
+                    raise ValidationError('duplicate keys', details={'keys': dups})
+            self._items.update(items)
+
+    def replace(self, key: K, item: V) -> None:
+        k = self._norm_key(key)
+        with self._lock:
+            assert_kernel_mutable()
+            if k not in self._items:
+                raise NotFoundError('key not found', details={'key': k})
+            self._items[k] = item
+
+    def unregister(self, key: K) -> bool:
+        k = self._norm_key(key)
+        with self._lock:
+            assert_kernel_mutable()
+            return self._items.pop(k, None) is not None
+
+    def clear(self) -> None:
+        with self._lock:
+            assert_kernel_mutable()
+            self._items.clear()
+
+    def get(self, key: K) -> Optional[V]:
+        k = self._norm_key(key)
+        with self._lock:
+            return self._items.get(k)
+
+    def require(self, key: K) -> V:
+        k = self._norm_key(key)
+        with self._lock:
+            if k not in self._items:
+                raise NotFoundError('key not found', details={'key': k})
+            return self._items[k]
+
+    def exists(self, key: K) -> bool:
+        k = self._norm_key(key)
+        with self._lock:
+            return k in self._items
+
+    def keys(self) -> Tuple[K, ...]:
+        with self._lock:
+            return tuple(sorted(self._items.keys()))
+
+    def values(self) -> Tuple[V, ...]:
+        with self._lock:
+            return tuple(self._items[k] for k in sorted(self._items.keys()))
+
+    def items(self) -> Tuple[Tuple[K, V], ...]:
+        with self._lock:
+            return tuple((k, self._items[k]) for k in sorted(self._items.keys()))
+
+    def list(self) -> Dict[K, V]:
+        with self._lock:
+            return {k: self._items[k] for k in sorted(self._items.keys())}
+
+    def snapshot(self) -> Dict[str, object]:
+        with self._lock:
+            keys = sorted(self._items.keys())
+            return {'size': len(self._items), 'keys': tuple(keys)}
+from __future__ import annotations
+from functools import wraps
+from typing import Callable, TypeVar, ParamSpec, Any
+from core.errors import ValidationError
+from core.registry.registry import Registry
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+HANDLERS: Registry[str, Callable[..., Any]] = Registry()
+
+def register_handler(key: str, fn: Callable[..., Any]) -> None:
+    if not callable(fn):
+        raise ValidationError('handler must be callable', details={'key': key})
+    HANDLERS.register(key, fn)
+
+
+def handler(key: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    def deco(fn: Callable[P, R]) -> Callable[P, R]:
+        if not callable(fn):
+            raise ValidationError('handler must be callable', details={'key': key})
+        HANDLERS.register(key, fn)
+        @wraps(fn)
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            return fn(*args, **kwargs)
+        return wrapped
+    return deco
+
+
+def get_handler(key: str) -> Callable[..., Any]:
+    return HANDLERS.require(key)
+from __future__ import annotations
+from functools import wraps
+from typing import Callable, ParamSpec, TypeVar
+from core.kernel.freeze import assert_kernel_mutable
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+__all__ = ['assert_kernel_mutable', 'guard_mutation']
+
+def guard_mutation(fn: Callable[P, R]) -> Callable[P, R]:
+    @wraps(fn)
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        assert_kernel_mutable()
+        return fn(*args, **kwargs)
+    return wrapped
+from __future__ import annotations
+from typing import Any, Protocol
+
+class Registrable(Protocol):
+    key: str
+    def __repr__(self) -> str:  # pragma: no cover
+        ...
+from __future__ import annotations
+from typing import Any, ClassVar, Dict, Iterable, Mapping, Optional, Tuple, Final
+
+# ---------------------------------------------------------------------
+# Core error contract
+# ---------------------------------------------------------------------
+# Only JSON-safe scalar types are guaranteed to propagate across boundaries.
+_JSON_SCALARS: Final[Tuple[type, ...]] = (str, int, float, bool, type(None))
+
+def _jsonify(value: Any, *, max_len: int = 10_000) -> Any:
+    """
+    Best-effort JSON-like conversion:
+    - Keep JSON scalars untouched
+    - Convert dict -> dict with recursively processed values
+    - Convert list/tuple -> list with recursively processed values
+    - Fallback to repr(value) truncated to max_len
+    This avoids surprising serialization failures at process or transport boundaries.
+    """
+    if isinstance(value, _JSON_SCALARS):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _jsonify(v, max_len=max_len) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonify(v, max_len=max_len) for v in value]
+    # Fallback: ensure bounded size and redaction of binary blobs by repr
+    text = repr(value)
+    return text if len(text) <= max_len else (text[: max_len - 3] + '...')
+
+
+def _merge_details(base: Optional[Mapping[str, Any]], extra: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    if base:
+        result.update(base)
+    if extra:
+        result.update(extra)
+    # Ensure JSON-ish shape
+    return _jsonify(result)  # type: ignore[return-value]
+
+
+class KernelError(Exception):
+    """
+    Base class for all kernel (core) errors.
+    Contract:
+    - code: stable machine-readable string (AFH_* namespace)
+    - http_status: recommended HTTP mapping (used by adapters/edges)
+    - retryable: whether a caller MAY re-attempt (idempotency still required)
+    - details: JSON-safe, non-sensitive diagnostics (never include secrets)
+    """
+    code: ClassVar[str] = 'AFH_KERNEL_ERROR'
+    http_status: ClassVar[int] = 500
+    retryable: ClassVar[bool] = False
+
+    # A minimal, stable surface used by tooling, logs, API edges
+    message: str
+    details: Dict[str, Any]
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: Optional[Mapping[str, Any]] = None,
+        cause: Optional[BaseException] = None,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.details = _jsonify(dict(details or {}))  # type: ignore[assignment]
+        if cause is not None:
+            # PEP 3134 compatible chaining; not serialized by default
+            self.__cause__ = cause
+
+    # ----------------------- helpers & shape -----------------------
+    def to_dict(
+        self,
+        *,
+        include_code: bool = True,
+        include_http_status: bool = True,
+        include_retryable: bool = True,
+        redact_keys: Iterable[str] = (
+            'secret', 'password', 'token', 'authorization', 'api_key'
+        ),
+    ) -> Dict[str, Any]:
+        """
+        JSON-safe public representation of this error.
+        Do NOT include stack traces here; outward surfaces should stay deterministic and non-sensitive.
+        """
+        public_details: Dict[str, Any] = {}
+        for k, v in (self.details or {}).items():
+            key_lc = str(k).lower()
+            if any(rk in key_lc for rk in redact_keys):
+                public_details[k] = '***redacted***'
+            else:
+                public_details[k] = v
+        out: Dict[str, Any] = {'message': self.message, 'details': public_details}
+        if include_code:
+            out['code'] = type(self).code
+        if include_http_status:
+            out['http_status'] = type(self).http_status
+        if include_retryable:
+            out['retryable'] = bool(type(self).retryable)
+        return out
+
+    def __str__(self) -> str:  # pragma: no cover (human-friendly)
+        return f"{type(self).code} [{type(self).http_status}]" + \
+               (" [retryable]" if type(self).retryable else '') + f": {self.message}"
+
+
+# ---------------------------------------------------------------------
+# Canonical error hierarchy (stable codes)
+# ---------------------------------------------------------------------
+class KernelFrozenError(KernelError):
+    code = 'AFH_KERNEL_FROZEN'
+    http_status = 409
+    retryable = False
+
+
+class ValidationError(KernelError):
+    code = 'AFH_VALIDATION'
+    http_status = 400
+    retryable = False
+
+
+class PermissionDenied(KernelError):
+    code = 'AFH_PERMISSION_DENIED'
+    http_status = 403
+    retryable = False
+
+
+class NotFoundError(KernelError):
+    code = 'AFH_NOT_FOUND'
+    http_status = 404
+    retryable = False
+
+
+class ConflictError(KernelError):
+    code = 'AFH_CONFLICT'
+    http_status = 409
+    retryable = False
+
+
+class StrictWriteViolation(KernelError):
+    code = 'AFH_STRICT_WRITE'
+    http_status = 409
+    retryable = False
+
+
+class TenantContextMissing(KernelError):
+    code = 'AFH_TENANT_CTX_MISSING'
+    http_status = 400
+    retryable = False
+
+
+class TenantIsolationError(KernelError):
+    code = 'AFH_TENANT_ISOLATION'
+    http_status = 409
+    retryable = False
+
+
+class RateLimitExceeded(KernelError):
+    code = 'AFH_RATE_LIMIT'
+    http_status = 429
+    retryable = True
+
+
+class CircuitOpen(KernelError):
+    code = 'AFH_CIRCUIT_OPEN'
+    http_status = 503
+    retryable = True
+
+
+class IdempotencyViolation(KernelError):
+    code = 'AFH_IDEMPOTENCY'
+    http_status = 409
+    retryable = False
+
+
+class OutboxDeliveryError(KernelError):
+    code = 'AFH_OUTBOX_DELIVERY'
+    http_status = 502
+    retryable = True
+
+
+class ServiceUnavailableError(KernelError):
+    code = 'AFH_SERVICE_UNAVAILABLE'
+    http_status = 503
+    retryable = True
+
+
+class UnknownKernelError(KernelError):
+    """
+    Fallback for unknown exceptions. Prefer to convert unexpected exceptions to this type
+    so outward surfaces stay stable and JSON-safe.
+    """
+    code = 'AFH_UNKNOWN'
+    http_status = 500
+    retryable = False
+
+
+# ---------------------------------------------------------------------
+# Normalization helpers
+# ---------------------------------------------------------------------
+
+def coerce_kernel_error(exc: BaseException, *, message: Optional[str] = None) -> KernelError:
+    """
+    Convert any exception into a KernelError instance, preserving key information in JSON-safe form.
+    If 'exc' is already a KernelError, it is returned as-is (optionally merging message).
+    """
+    if isinstance(exc, KernelError):
+        if message and message != exc.message:
+            # Merge a clarified message while keeping details and the concrete error type
+            merged = type(exc)(message, details=exc.details, cause=exc.__cause__ if hasattr(exc, '__cause__') else None)
+            return merged
+        return exc
+    # Unknown exceptions
+    base_msg = message or str(exc) or 'Unknown error'
+    return UnknownKernelError(base_msg, details={'type': type(exc).__name__})
+
+
+def with_details(err: KernelError, **new_details: Any) -> KernelError:
+    """
+    Return a *new* instance of the same error type with merged (JSON-safe) details.
+    Useful when enriching errors across layers while preserving the concrete class.
+    """
+    merged = _merge_details(err.details, new_details)
+    return type(err)(err.message, details=merged, cause=err.__cause__ if hasattr(err, '__cause__') else None)
+
+
+__all__ = [
+    # base
+    'KernelError',
+    # concrete errors
+    'KernelFrozenError',
+    'ValidationError',
+    'PermissionDenied',
+    'NotFoundError',
+    'ConflictError',
+    'StrictWriteViolation',
+    'TenantContextMissing',
+    'TenantIsolationError',
+    'RateLimitExceeded',
+    'CircuitOpen',
+    'IdempotencyViolation',
+    'OutboxDeliveryError',
+    'ServiceUnavailableError',
+    'UnknownKernelError',
+    # helpers
+    'coerce_kernel_error',
+    'with_details',
+]
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Mapping, Any, Final, Pattern
+import re
+from core.errors import ValidationError
+from core.typing import JSONObject, JSONValue, EventType
+
+_EVENT_TYPE_RE: Final[Pattern[str]] = re.compile(r'^[a-z][a-z0-9._-]*$', re.ASCII)
+
+
+def _validate_event_type(value: str) -> EventType:
+    if not isinstance(value, str):
+        raise ValidationError('event.type must be a string')
+    v = value.strip().lower()
+    if not _EVENT_TYPE_RE.match(v):
+        raise ValidationError('invalid event type', details={'type': value})
+    return EventType(v)
+
+
+@dataclass(frozen=True, slots=True)
+class Event:
+    type: EventType
+    payload: Mapping[str, JSONValue]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'type', _validate_event_type(str(self.type)))
+        if not isinstance(self.payload, Mapping):
+            raise ValidationError('event.payload must be a mapping (dict-like)')
+
+    def to_dict(self) -> JSONObject:
+        return {'type': str(self.type), 'payload': dict(self.payload)}
+
+    @staticmethod
+    def from_dict(data: Mapping[str, Any]) -> 'Event':
+        try:
+            t = _validate_event_type(str(data['type']))
+            p = data.get('payload') or {}
+            if not isinstance(p, Mapping):
+                raise ValidationError('event.payload must be a mapping')
+            return Event(type=t, payload=p)  # type: ignore[arg-type]
+        except KeyError as exc:
+            raise ValidationError('missing event field', details={'missing': str(exc)}) from exc
+from __future__ import annotations
+from dataclasses import dataclass
+from threading import RLock
+from typing import Callable, Dict, List, Tuple
+from core.errors import ValidationError
+from core.events.event import Event
+
+Handler = Callable[[Event], None]
+
+@dataclass(frozen=True)
+class _Entry:
+    token: str
+    event_type: str
+    handler: Handler
+
+
+class InProcessBus:
+    def __init__(self, *, stop_on_error: bool = True) -> None:
+        self._lock = RLock()
+        self._handlers: Dict[str, List[_Entry]] = {}
+        self._next_id = 1
+        self._stop_on_error = bool(stop_on_error)
+
+    def on(self, event_type: str, handler: Handler) -> str:
+        if not callable(handler):
+            raise ValidationError('handler must be callable')
+        with self._lock:
+            token = f'h_{self._next_id}'
+            self._next_id += 1
+            lst = self._handlers.setdefault(str(event_type), [])
+            lst.append(_Entry(token, str(event_type), handler))
+            return token
+
+    def off(self, token: str) -> bool:
+        with self._lock:
+            for et, lst in self._handlers.items():
+                for i, e in enumerate(lst):
+                    if e.token == token:
+                        del lst[i]
+                        return True
+            return False
+
+    def clear(self) -> None:
+        with self._lock:
+            self._handlers.clear()
+
+    def handlers_snapshot(self) -> Dict[str, Tuple[str, ...]]:
+        with self._lock:
+            return {k: tuple(e.token for e in v) for k, v in self._handlers.items()}
+
+    def publish(self, event: Event) -> int:
+        with self._lock:
+            entries = list(self._handlers.get(str(event.type), []))
+            if not entries:
+                return 0
+            invoked = 0
+            errors: List[BaseException] = []
+            for e in entries:
+                try:
+                    e.handler(event)
+                    invoked += 1
+                except Exception as exc:
+                    errors.append(exc)
+                    if self._stop_on_error:
+                        break
+            if errors and self._stop_on_error:
+                raise errors[0]
+            return invoked
+from __future__ import annotations
+from typing import Mapping, Any, Dict, Final
+import re
+from core.errors import ValidationError
+from core.typing import HeaderScalar, ReadonlyHeaders, MutableHeaders
+
+_KEY_RE: Final[re.Pattern[str]] = re.compile(r'^[a-z0-9._-]+$', re.ASCII)
+
+
+def validate_headers(headers: Mapping[str, Any]) -> None:
+    if headers is None:
+        return
+    if not isinstance(headers, Mapping):
+        raise ValidationError('headers must be a mapping')
+    for k, v in headers.items():
+        if not isinstance(k, str):
+            raise ValidationError('header keys must be strings', details={'key': k})
+        key = k.strip().lower()
+        if key != k:
+            raise ValidationError('header keys must be lowercase without spaces', details={'key': k})
+        if not _KEY_RE.match(key):
+            raise ValidationError('invalid header key', details={'key': k})
+        if not (isinstance(v, (str, int, float)) or v is None):
+            raise ValidationError('invalid header value type', details={'key': k, 'type': type(v).__name__})
+
+
+def normalize_headers(headers: Mapping[str, Any]) -> MutableHeaders:
+    norm: MutableHeaders = {}
+    for k, v in headers.items():
+        key = str(k).strip().lower()
+        norm[key] = v
+    validate_headers(norm)
+    return norm
+
+
+def merge_headers(*maps: ReadonlyHeaders, allow_overwrite: bool = True) -> MutableHeaders:
+    out: MutableHeaders = {}
+    for m in maps:
+        if not m:
+            continue
+        cur = normalize_headers(m)
+        if not allow_overwrite:
+            dup = [k for k in cur.keys() if k in out]
+            if dup:
+                raise ValidationError('duplicate headers not allowed', details={'keys': dup})
+        out.update(cur)
+    return out
+
+# Canonical keys
+X_TENANT = 'x_tenant'
+X_TRACE_ID = 'x_trace_id'
+X_ACTOR = 'x_actor'
+X_EVENT_TYPE = 'x_event_type'
+X_IDEMPOTENCY_KEY = 'x_idempotency_key'
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Optional, Mapping, Any
+from core.errors import ValidationError
+from core.identity.uuid import uuid7_str
+from core.time.clock import now_ms
+from core.events.event import Event
+from core.events.headers import (
+    validate_headers,
+    merge_headers,
+    X_TENANT,
+    X_TRACE_ID,
+    X_ACTOR,
+    X_EVENT_TYPE,
+    X_IDEMPOTENCY_KEY,
+)
+from core.typing import TenantId, TraceId, ActorId, UUIDStr, Millis, JSONObject, ReadonlyHeaders
+
+
+@dataclass(frozen=True, slots=True)
+class Envelope:
+    id: UUIDStr
+    tenant_id: TenantId
+    event: Event
+    ts_ms: Millis
+    trace_id: Optional[TraceId] = None
+    actor: Optional[ActorId] = None
+    headers: Optional[ReadonlyHeaders] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ts_ms, int) or self.ts_ms <= 0:
+            raise ValidationError('ts_ms must be a positive integer')
+        if self.headers is not None:
+            validate_headers(self.headers)
+
+    def to_dict(self) -> JSONObject:
+        d: JSONObject = {
+            'id': str(self.id),
+            'tenant_id': str(self.tenant_id),
+            'ts_ms': int(self.ts_ms),
+            'event': self.event.to_dict(),
+        }
+        if self.trace_id is not None:
+            d['trace_id'] = str(self.trace_id)
+        if self.actor is not None:
+            d['actor'] = str(self.actor)
+        if self.headers is not None:
+            d['headers'] = dict(self.headers)
+        return d
+
+
+def _default_headers(env: Envelope) -> dict:
+    h: dict[str, Any] = {
+        X_EVENT_TYPE: str(env.event.type),
+        X_TENANT: str(env.tenant_id),
+        X_IDEMPOTENCY_KEY: str(env.id),
+    }
+    if env.trace_id:
+        h[X_TRACE_ID] = str(env.trace_id)
+    if env.actor:
+        h[X_ACTOR] = str(env.actor)
+    validate_headers(h)
+    return h
+
+
+def build_envelope(
+    *,
+    tenant_id: str,
+    event: Event,
+    trace_id: Optional[str] = None,
+    actor: Optional[str] = None,
+    ts_ms: Optional[int] = None,
+    id: Optional[str] = None,
+    headers: Optional[Mapping[str, Any]] = None,
+) -> Envelope:
+    env = Envelope(
+        id=UUIDStr(id or uuid7_str()),
+        tenant_id=TenantId(tenant_id),
+        event=event,
+        ts_ms=Millis(int(ts_ms if ts_ms is not None else now_ms())),
+        trace_id=TraceId(trace_id) if trace_id else None,
+        actor=ActorId(actor) if actor else None,
+        headers=None,
+    )
+    base = _default_headers(env)
+    merged = merge_headers(base, headers or {})
+    return Envelope(
+        id=env.id,
+        tenant_id=env.tenant_id,
+        event=env.event,
+        ts_ms=env.ts_ms,
+        trace_id=env.trace_id,
+        actor=env.actor,
+        headers=merged,
+    )
+from __future__ import annotations
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, Protocol, Tuple, Dict, TypeVar, ParamSpec
+from core.errors import ValidationError, IdempotencyViolation
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+class IdempotencyStore(Protocol):
+    def put_if_absent(self, key: str, ttl_seconds: int) -> bool: ...
+    def get(self, key: str) -> Optional[Tuple[int, Any]]: ...
+    def set_result(self, key: str, value: Any) -> None: ...
+    def purge_expired(self, now_epoch_sec: Optional[int] = None) -> None: ...
+
+
+@dataclass
+class MemoryIdempotencyStore(IdempotencyStore):
+    _data: Dict[str, Tuple[int, Any]] = None  # type: ignore[assignment]
+    def __post_init__(self) -> None:
+        object.__setattr__(self, '_data', {})
+        object.__setattr__(self, '_lock', threading.RLock())
+    def _now(self) -> int:
+        return int(time.time())
+    def put_if_absent(self, key: str, ttl_seconds: int) -> bool:
+        with self._lock:
+            self.purge_expired()
+            if key in self._data:
+                return False
+            self._data[key] = (self._now() + int(ttl_seconds), None)
+            return True
+    def get(self, key: str) -> Optional[Tuple[int, Any]]:
+        with self._lock:
+            self.purge_expired()
+            return self._data.get(key)
+    def set_result(self, key: str, value: Any) -> None:
+        with self._lock:
+            if key in self._data:
+                exp, _ = self._data[key]
+                self._data[key] = (exp, value)
+    def purge_expired(self, now_epoch_sec: Optional[int] = None) -> None:
+        now = int(now_epoch_sec if now_epoch_sec is not None else self._now())
+        with self._lock:
+            to_del = [k for k, (exp, _) in self._data.items() if exp <= now]
+            for k in to_del:
+                del self._data[k]
+
+
+def _require_key(key: Any) -> str:
+    if not isinstance(key, str):
+        raise ValidationError('idempotency key must be a string', details={'type': type(key).__name__})
+    k = key.strip()
+    if not k:
+        raise ValidationError('idempotency key must be non-empty')
+    if len(k) > 256:
+        raise ValidationError('idempotency key too long', details={'max': 256})
+    return k
+
+
+def idempotent(key_fn: Callable[P, str], *, store: IdempotencyStore, ttl_seconds: int = 3600, on_duplicate: str = 'return_cached') -> Callable[[Callable[P, R]], Callable[P, Optional[R]]]:
+    if on_duplicate not in ('raise', 'return_none', 'return_cached'):
+        raise ValidationError('invalid on_duplicate value', details={'allowed': ['raise', 'return_none', 'return_cached']})
+    def decorator(fn: Callable[P, R]) -> Callable[P, Optional[R]]:
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> Optional[R]:
+            key_raw = key_fn(*args, **kwargs)
+            key = _require_key(key_raw)
+            created = store.put_if_absent(key, int(ttl_seconds))
+            if not created:
+                if on_duplicate == 'raise':
+                    raise IdempotencyViolation('duplicate request', details={'key': key})
+                if on_duplicate == 'return_cached':
+                    cached = store.get(key)
+                    if cached is not None:
+                        _, value = cached
+                        return value if value is not None else None
+                return None
+            result = fn(*args, **kwargs)
+            if on_duplicate == 'return_cached':
+                store.set_result(key, result)
+            return result
+        return wrapped
+    return decorator
+from __future__ import annotations
+from time import monotonic
+from dataclasses import dataclass
+from typing import Callable, TypeVar, ParamSpec
+from threading import RLock
+from core.errors import PermissionDenied, ValidationError
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+@dataclass
+class CircuitBreaker:
+    failures: int = 5
+    reset_seconds: float = 30.0
+    def __post_init__(self) -> None:
+        if not isinstance(self.failures, int) or self.failures < 1:
+            raise ValidationError('failures must be >= 1')
+        if not isinstance(self.reset_seconds, (int, float)) or self.reset_seconds <= 0:
+            raise ValidationError('reset_seconds must be > 0')
+        object.__setattr__(self, '_fail_count', 0)
+        object.__setattr__(self, '_opened_at', None)
+        object.__setattr__(self, '_half_open_trial', False)
+        object.__setattr__(self, '_lock', RLock())
+    def allow(self) -> None:
+        with self._lock:
+            if self._opened_at is None:
+                return
+            elapsed = monotonic() - self._opened_at
+            if elapsed < self.reset_seconds:
+                raise PermissionDenied('circuit open')
+            self._half_open_trial = True
+    def mark_success(self) -> None:
+        with self._lock:
+            self._fail_count = 0
+            if self._opened_at is not None and self._half_open_trial:
+                self._opened_at = None
+                self._half_open_trial = False
+    def mark_failure(self) -> None:
+        with self._lock:
+            if self._opened_at is None:
+                self._fail_count += 1
+                if self._fail_count >= self.failures:
+                    self._opened_at = monotonic()
+                    self._half_open_trial = False
+                    self._fail_count = 0
+            else:
+                self._opened_at = monotonic()
+                self._half_open_trial = False
+                self._fail_count = 0
+    def protect(self, fn: Callable[P, R]) -> Callable[P, R]:
+        def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+            self.allow()
+            try:
+                result = fn(*args, **kwargs)
+            except Exception:
+                self.mark_failure()
+                raise
+            else:
+                self.mark_success()
+                return result
+        return wrapped
+from __future__ import annotations
+from time import monotonic
+from typing import Dict
+from threading import RLock
+from core.errors import PermissionDenied, ValidationError
+
+class TokenBucket:
+    __slots__ = ('rate', 'cap', 'tokens', 't')
+    def __init__(self, rate_per_sec: float, capacity: int):
+        if not isinstance(rate_per_sec, (int, float)) or rate_per_sec <= 0:
+            raise ValidationError('rate_per_sec must be > 0')
+        if not isinstance(capacity, int) or capacity < 1:
+            raise ValidationError('capacity must be >= 1')
+        self.rate = float(rate_per_sec)
+        self.cap = int(capacity)
+        self.tokens = float(capacity)
+        self.t = monotonic()
+    def allow(self) -> bool:
+        now = monotonic()
+        self.tokens = min(self.cap, self.tokens + (now - self.t) * self.rate)
+        self.t = now
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+
+class RateLimiter:
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._buckets: Dict[str, TokenBucket] = {}
+    def require(self, key: str, *, rate_per_sec: float = 5.0, capacity: int = 10) -> None:
+        if not isinstance(key, str) or not key.strip():
+            raise ValidationError('key must be a non-empty string')
+        with self._lock:
+            b = self._buckets.get(key)
+            if b is None:
+                b = TokenBucket(rate_per_sec, capacity)
+                self._buckets[key] = b
+            ok = b.allow()
+            if not ok:
+                raise PermissionDenied('rate limit exceeded', details={'key': key, 'rate': rate_per_sec, 'capacity': capacity})
+
+_GLOBAL = RateLimiter()
+
+def require_rate(key: str, *, rate_per_sec: float = 5.0, capacity: int = 10) -> None:
+    _GLOBAL.require(key, rate_per_sec=rate_per_sec, capacity=capacity)
+from __future__ import annotations
+from typing import Iterable, Mapping, Sequence, Sized, Any, Optional
+from core.errors import ValidationError
+
+
+def require(condition: bool, *, message: str = 'Precondition failed', **details) -> None:
+    if not condition:
+        raise ValidationError(message, details=details)
+
+
+def require_non_empty_str(name: str, value: Any, *, max_len: Optional[int] = None) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f'{name} must be a string', details={'field': name, 'type': type(value).__name__})
+    v = value.strip()
+    if not v:
+        raise ValidationError(f'{name} must be non-empty', details={'field': name})
+    if max_len is not None and len(v) > max_len:
+        raise ValidationError(f'{name} too long', details={'field': name, 'max': max_len, 'len': len(v)})
+    return v
+
+
+def require_mapping(name: str, value: Any) -> Mapping[Any, Any]:
+    if not isinstance(value, Mapping):
+        raise ValidationError(f'{name} must be a mapping (dict-like)', details={'field': name, 'type': type(value).__name__})
+    return value
+
+
+def require_sequence(name: str, value: Any) -> Sequence[Any]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValidationError(f'{name} must be a sequence', details={'field': name, 'type': type(value).__name__})
+    return value
+
+
+def require_non_empty_collection(name: str, value: Any) -> Sized:
+    if not hasattr(value, '__len__'):
+        raise ValidationError(f'{name} must be a sized collection', details={'field': name, 'type': type(value).__name__})
+    if len(value) <= 0:  # type: ignore[arg-type]
+        raise ValidationError(f'{name} must be non-empty', details={'field': name})
+    return value  # type: ignore[return-value]
+
+
+def require_positive_int(name: str, value: Any, *, allow_zero: bool = False) -> int:
+    if not isinstance(value, int):
+        raise ValidationError(f'{name} must be an int', details={'field': name, 'type': type(value).__name__})
+    if allow_zero and value < 0:
+        raise ValidationError(f'{name} must be >= 0', details={'field': name, 'value': value})
+    if not allow_zero and value <= 0:
+        raise ValidationError(f'{name} must be > 0', details={'field': name, 'value': value})
+    return value
+
+
+def require_in_range(name: str, value: Any, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
+    if not isinstance(value, (int, float)):
+        raise ValidationError(f'{name} must be numeric', details={'field': name, 'type': type(value).__name__})
+    if min_value is not None and value < min_value:
+        raise ValidationError(f'{name} smaller than minimum', details={'field': name, 'min': min_value, 'value': value})
+    if max_value is not None and value > max_value:
+        raise ValidationError(f'{name} greater than maximum', details={'field': name, 'max': max_value, 'value': value})
+    return float(value)
+
+
+def require_enum(name: str, value: Any, allowed: Iterable[Any]) -> Any:
+    choices = tuple(allowed)
+    if value not in choices:
+        raise ValidationError(f'{name} must be one of {choices!r}', details={'field': name, 'value': value, 'allowed': choices})
+    return value
+from __future__ import annotations
+import threading
+from typing import Callable, Dict, List, Optional, Tuple
+from core.errors import KernelFrozenError, ValidationError
+
+# ---------------------------------------------------------------------
+# Internal state (guarded by _LOCK)
+# ---------------------------------------------------------------------
+_LOCK = threading.RLock()
+# STATES: MUTABLE -> FREEZING -> FROZEN (one-way)
+_STATE: str = 'MUTABLE'
+_SINCE_MS: Optional[int] = None
+_REASON: Optional[str] = None
+
+# Registered "on-freeze" callbacks; append-only until FREEZING
+# Each item is (token, callback)
+_FREEZE_CALLBACKS: List[Tuple[str, Callable[[], None]]] = []
+_NEXT_TOKEN: int = 1
+# Last freeze report (non-fatal callback errors are captured here)
+_LAST_FREEZE_ERRORS: List[str] = []
+
+
+def _now_ms() -> int:
+    """Use the canonical time source. Local import prevents module cycles."""
+    from core.time.clock import now_ms  # local import to avoid kernel<->time cycle
+    return int(now_ms())
+
+# ---------------------------------------------------------------------
+# Query helpers
+# ---------------------------------------------------------------------
+
+def is_kernel_frozen() -> bool:
+    with _LOCK:
+        return _STATE == 'FROZEN'
+
+
+def is_kernel_freezing() -> bool:
+    with _LOCK:
+        return _STATE == 'FREEZING'
+
+
+def assert_kernel_mutable(message: Optional[str] = None) -> None:
+    """Enforce that the kernel is still mutable. Call this before any global registration."""
+    if is_kernel_frozen():
+        raise KernelFrozenError(message or 'Kernel is frozen; runtime mutation is not allowed.')
+
+
+def assert_kernel_frozen(message: Optional[str] = None) -> None:
+    """Useful for edges/health: ensure kernel reached a frozen (steady) state."""
+    if not is_kernel_frozen():
+        raise ValidationError(message or 'Kernel has not been frozen yet.')
+
+
+def get_freeze_snapshot() -> Dict[str, object]:
+    """Introspect current freeze state. This is read-only and safe for diagnostics/health checks."""
+    with _LOCK:
+        return {
+            'state': _STATE,
+            'since_ms': _SINCE_MS,
+            'reason': _REASON,
+            'callbacks_registered': len(_FREEZE_CALLBACKS) if _STATE == 'MUTABLE' else 0,
+            'last_freeze_errors': list(_LAST_FREEZE_ERRORS),
+        }
+
+# ---------------------------------------------------------------------
+# Callback registration (pre-freeze only)
+# ---------------------------------------------------------------------
+
+def on_freeze(callback: Callable[[], None]) -> str:
+    """
+    Register a callback to run exactly once during freeze. If the kernel
+    is already FROZEN, the callback executes immediately (synchronously).
+    Returns a token that can be used to deregister prior to freeze.
+    """
+    if not callable(callback):
+        raise ValidationError('on_freeze requires a callable')
+    with _LOCK:
+        global _NEXT_TOKEN
+        if _STATE == 'FROZEN':
+            # Already frozen: execute immediately
+            try:
+                callback()
+            except Exception as exc:
+                # Non-fatal: record for diagnostics
+                _LAST_FREEZE_ERRORS.append(f"{type(exc).__name__}: {exc}")
+            return 'executed-immediately'
+        if _STATE != 'MUTABLE':
+            # FREEZING window: do not allow new registrations
+            raise KernelFrozenError('Kernel is already freezing; cannot register new on_freeze callbacks.')
+        token = f'freeze_cb_{_NEXT_TOKEN}'
+        _NEXT_TOKEN += 1
+        _FREEZE_CALLBACKS.append((token, callback))
+        return token
+
+
+def remove_on_freeze(token: str) -> bool:
+    """Best-effort deregistration of a pending on_freeze callback. Returns True if a callback was removed."""
+    with _LOCK:
+        if _STATE != 'MUTABLE':
+            return False
+        for idx, (t, _) in enumerate(_FREEZE_CALLBACKS):
+            if t == token:
+                del _FREEZE_CALLBACKS[idx]
+                return True
+        return False
+
+
+def clear_on_freeze_callbacks() -> int:
+    """Remove all pending callbacks (only while MUTABLE). Returns the count removed."""
+    with _LOCK:
+        if _STATE != 'MUTABLE':
+            return 0
+        count = len(_FREEZE_CALLBACKS)
+        _FREEZE_CALLBACKS.clear()
+        return count
+
+# ---------------------------------------------------------------------
+# Freeze transition (one-way)
+# ---------------------------------------------------------------------
+
+def freeze_kernel(*, reason: Optional[str] = None, run_callbacks: bool = True) -> None:
+    """
+    Perform the one-way transition to FROZEN.
+    Semantics:
+    - Idempotent: multiple invocations are safe.
+    - Transitions MUTABLE -> FREEZING -> FROZEN.
+    - Registered callbacks run exactly once (in FREEZING), outside the lock.
+    - Callback failures are captured in diagnostics but do not unblock freeze.
+    """
+    with _LOCK:
+        global _STATE, _SINCE_MS, _REASON
+        if _STATE == 'FROZEN':
+            return
+        if _STATE == 'MUTABLE':
+            _STATE = 'FREEZING'
+            _SINCE_MS = _now_ms()
+            _REASON = (reason or '').strip() or None
+            # Snapshot callbacks to run outside the lock
+            callbacks = list(_FREEZE_CALLBACKS)
+            _FREEZE_CALLBACKS.clear()
+        else:
+            # Already FREEZING by another thread; wait-free idempotence
+            callbacks = []
+
+    # Run callbacks outside the global lock to avoid deadlocks.
+    if run_callbacks and callbacks:
+        for _, cb in callbacks:
+            try:
+                cb()
+            except Exception as exc:
+                # Record non-fatal callback error
+                with _LOCK:
+                    _LAST_FREEZE_ERRORS.append(f"{type(exc).__name__}: {exc}")
+
+    # Finalize to FROZEN
+    with _LOCK:
+        _STATE = 'FROZEN'
+        # _SINCE_MS and _REASON already set in this freeze cycle.
+from __future__ import annotations
+from typing import Dict, List
+from core.errors import ValidationError
+from core.kernel.freeze import (
+    is_kernel_frozen,
+    is_kernel_freezing,
+    assert_kernel_mutable,
+    assert_kernel_frozen,
+    get_freeze_snapshot,
+)
+
+# ---------------------------------------------------------------------
+# Public API (lightweight integrity utilities)
+# ---------------------------------------------------------------------
+
+def kernel_status(*, include_domain_probes: bool = False) -> Dict[str, object]:
+    """
+    Return a diagnostic snapshot of kernel state + fast integrity probes.
+    Designed for health checks and CLI diagnostics.
+    """
+    snap = get_freeze_snapshot()
+    probes = {
+        'clock_ok': _probe_clock_contract(),
+    }
+    if include_domain_probes:
+        probes['grammars_ok'] = _probe_grammar_contract()
+    snap['probes'] = probes
+    snap['ok'] = all(bool(v) for v in probes.values())
+    return snap
+
+
+def assert_kernel_integrity(strict: bool = True, *, include_domain_probes: bool = False) -> None:
+    """
+    Validate essential invariants. If 'strict' is True, raise ValidationError
+    on any failure; otherwise, silently return (caller can inspect kernel_status()).
+    Invariants checked:
+    - Clock returns timezone-aware UTC datetimes.
+    - (Optional) Centralized regex grammars compile and match basic sets.
+    """
+    failures: List[str] = []
+    if not _probe_clock_contract():
+        failures.append('clock_contract')
+    if include_domain_probes and not _probe_grammar_contract():
+        failures.append('grammar_contract')
+    if strict and failures:
+        raise ValidationError('Kernel integrity check failed', details={'failures': failures})
+
+# ---------------------------------------------------------------------
+# Internal probes (imports are local to avoid circular dependencies)
+# ---------------------------------------------------------------------
+
+def _probe_clock_contract() -> bool:
+    """Check that core.time.clock.now() returns tz-aware UTC datetime and is callable."""
+    try:
+        from core.time.clock import now  # type: ignore
+        dt = now()
+        return getattr(dt, 'tzinfo', None) is not None
+    except Exception:
+        return False
+
+
+def _probe_grammar_contract() -> bool:
+    """Ensure centralized grammars exist and can validate basic cases (optional)."""
+    try:
+        from core.tenancy.grammar import validate_slug  # type: ignore
+        from core.rbac.grammar import validate_permission  # type: ignore
+        from core.outbox.topic_grammar import validate_topic  # type: ignore
+
+        _ = validate_slug('acme-01')
+        for bad in ('.acme', '-x', 'X', 'a'*65, 'bad..slug'):
+            try:
+                validate_slug(bad)
+                return False
+            except Exception:
+                pass
+
+        _ = validate_permission('core.health:read')
+        for bad in ('', 'core:', ':read', 'core health:read', 'core..a:*'):
+            try:
+                validate_permission(bad)
+                return False
+            except Exception:
+                pass
+
+        _ = validate_topic('events.core.change')
+        for bad in ('', 'UPPER', 'white space', 'slash/name'):
+            try:
+                validate_topic(bad)
+                return False
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+# ---------------------------------------------------------------------
+# Re-exports (commonly used by other packages)
+# ---------------------------------------------------------------------
+__all__ = [
+    'is_kernel_frozen',
+    'is_kernel_freezing',
+    'assert_kernel_mutable',
+    'assert_kernel_frozen',
+    'kernel_status',
+    'assert_kernel_integrity',
+]
