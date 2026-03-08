@@ -1,0 +1,35 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+*.log
+*.tmp
+*.cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+.hypothesis/
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+.env/
+
+# --- OS / IDE junk ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Local artifacts ---
+arch_report.json
+.lint-arch.json
+all_python_files.txt
+afrihome*.txt
