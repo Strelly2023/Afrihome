@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — RBAC Role Model (Immutable)
 ------------------------------------------------
@@ -12,12 +11,11 @@ Dependencies:
 No tenancy import: ENFORCED
 """
 
-
 from dataclasses import dataclass
 from typing import Tuple
 
+from core.rbac.grammar import validate_permission_pattern, validate_role_name
 from core.typing import RoleName
-from core.rbac.grammar import validate_role_name, validate_permission_pattern
 
 
 @dataclass(frozen=True, slots=True)

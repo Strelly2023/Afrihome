@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — In-Memory Outbox Store
 -------------------------------------------
@@ -9,12 +8,11 @@ IO: NONE
 Threads/async: NONE
 """
 
+from typing import Dict, List
 
-from typing import Dict, List, Optional
-
-from core.outbox.store_protocol import OutboxStore
 from core.outbox.model import OutboxRecord, OutboxStatus
-from core.typing import UnixMillis, EventId
+from core.outbox.store_protocol import OutboxStore
+from core.typing import EventId, UnixMillis
 
 
 class InMemoryOutboxStore(OutboxStore):
@@ -48,7 +46,8 @@ class InMemoryOutboxStore(OutboxStore):
         recs = [
             self._by_id[eid]
             for eid in ids
-            if (r := self._by_id[eid]).status is OutboxStatus.PENDING and r.next_attempt_ms <= now_ms
+            if (r := self._by_id[eid]).status is OutboxStatus.PENDING
+            and r.next_attempt_ms <= now_ms
         ]
         recs.sort(key=lambda r: (int(r.next_attempt_ms), str(r.event_id)))
         return recs[: max(0, limit)]

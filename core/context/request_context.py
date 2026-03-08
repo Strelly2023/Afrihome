@@ -19,16 +19,16 @@ Rules:
 from dataclasses import dataclass
 from typing import Optional
 
-from core.typing import (
-    TenantId,
-    UserId,
-    RequestId,
-    CorrelationId,
-    CausationId,
-    UnixMillis,
-)
-from core.kernel.invariants import assert_not_none
 from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
+from core.typing import (
+    CausationId,
+    CorrelationId,
+    RequestId,
+    TenantId,
+    UnixMillis,
+    UserId,
+)
 
 
 @dataclass(frozen=True, slots=True)

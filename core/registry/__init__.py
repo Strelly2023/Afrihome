@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Registry (Final Binding Layer)
 
@@ -15,11 +14,11 @@ Rules:
 - Deterministic order preserved by insertion
 """
 
-from .scopes import RegistryScope, DEFAULT_SCOPE_CHAIN, scope_rank
-from .services import ServiceRegistry, ServiceNotFoundError
+from .freeze_guard import assert_registry_mutable
 from .handlers import HandlerRegistry
 from .registry import CoreRegistry
-from .freeze_guard import assert_registry_mutable
+from .scopes import DEFAULT_SCOPE_CHAIN, RegistryScope, scope_rank
+from .services import ServiceNotFoundError, ServiceRegistry
 
 __all__ = [
     "RegistryScope",

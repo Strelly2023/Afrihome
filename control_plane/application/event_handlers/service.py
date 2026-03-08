@@ -1,13 +1,16 @@
 from dataclasses import dataclass
 from typing import Mapping, Tuple
-from core.kernel.invariants import assert_not_none
+
+from control_plane.application.execution.models import ExecutionFrame
 from core.errors import ValidationError
 from core.events import EventEnvelope
+from core.kernel.invariants import assert_not_none
 from core.outbox.topic_grammar import validate_topic  # canonical topic grammar  # noqa
-from control_plane.application.execution.models import ExecutionFrame
-from .router import EventRouter
+
+from .models import OutboxWrite, ReactionPlan
 from .protocols import OutboxWriter
-from .models import ReactionPlan, OutboxWrite
+from .router import EventRouter
+
 
 @dataclass(frozen=True, slots=True)
 class EventHandlingService:
@@ -18,6 +21,7 @@ class EventHandlingService:
       3) Validate topics with outbox grammar (pure)
       4) Optionally write to outbox via a protocol port (no IO here)
     """
+
     router: EventRouter
     topic_policy: Mapping[str, str]  # event_type -> outbox topic (e.g., "notifications.outbound")
     outbox: OutboxWriter | None = None

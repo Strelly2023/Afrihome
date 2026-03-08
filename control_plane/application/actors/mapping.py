@@ -1,10 +1,12 @@
-#control_plane/application/actors/mapping.py
+# control_plane/application/actors/mapping.py
 from typing import Mapping, Optional, Tuple
-from core.typing import UserId, RoleName
-from core.kernel.invariants import assert_not_none
+
 from core.errors import ValidationError
+from core.kernel.invariants import assert_not_none
+from core.typing import RoleName, UserId
+
+from .constants import HDR_ACTOR_KIND, HDR_PRINCIPAL, HDR_ROLES, HDR_USER_ID
 from .models import Actor, ActorKind
-from .constants import HDR_ACTOR_KIND, HDR_USER_ID, HDR_ROLES, HDR_PRINCIPAL
 
 _VALID_KINDS = {
     "user": ActorKind.USER,
@@ -12,6 +14,7 @@ _VALID_KINDS = {
     "system": ActorKind.SYSTEM,
     "operator": ActorKind.OPERATOR,
 }
+
 
 def _parse_roles(raw: Optional[str]) -> Tuple[RoleName, ...]:
     if not raw:
@@ -25,6 +28,7 @@ def _parse_roles(raw: Optional[str]) -> Tuple[RoleName, ...]:
             seen.add(r)
             out.append(RoleName(r))
     return tuple(out)
+
 
 def map_headers_to_actor(headers: Mapping[str, str]) -> Actor:
     """

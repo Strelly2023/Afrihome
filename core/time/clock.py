@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Clock Authority
 -------------------------------------
@@ -13,12 +12,11 @@ Rules:
 - No datetime.now() in models.
 """
 
-
 import time
 from typing import Protocol, runtime_checkable
 
-from core.typing import UnixMillis
 from core.errors import InvariantViolationError
+from core.typing import UnixMillis
 
 
 @runtime_checkable

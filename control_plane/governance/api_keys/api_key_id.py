@@ -1,11 +1,15 @@
+# control_plane/governance/api_keys/api_key_id.py
 from dataclasses import dataclass
+
 from core.kernel.invariants import assert_not_none
+
 
 @dataclass(frozen=True, slots=True)
 class ApiKeyId:
     """
     Stable identifier of an API key (NOT the secret token).
     """
+
     value: str
 
     def __post_init__(self) -> None:

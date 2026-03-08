@@ -14,14 +14,14 @@ Rules:
 
 from dataclasses import dataclass
 
+from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
 from core.typing import (
-    CorrelationId,
     CausationId,
+    CorrelationId,
     TenantId,
     UnixMillis,
 )
-from core.kernel.invariants import assert_not_none
-from core.errors import InvariantViolationError
 
 
 @dataclass(frozen=True, slots=True)

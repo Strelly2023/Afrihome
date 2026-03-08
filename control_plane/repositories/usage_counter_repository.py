@@ -1,10 +1,9 @@
-#control_plane/repositories.usage_counter_repository.py
-from typing import Protocol, Iterable, runtime_checkable
+# control_plane/repositories.usage_counter_repository.py
+from typing import Iterable, Protocol, runtime_checkable
 
 from control_plane.governance.usage.usage_counter import UsageCounter
 from control_plane.governance.usage.windowing import UsageGranularity
 from core.typing import TenantId, UnixMillis
-
 
 
 @runtime_checkable

@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Health Registry (In-Memory)
 ------------------------------------------------
@@ -15,14 +14,13 @@ Rules:
 - No IO / No logging / No threads / No async
 """
 
-
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable, Dict, Mapping, Any, Optional, Protocol, runtime_checkable, Tuple
+from typing import Any, Dict, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
-from core.typing import UnixMillis
-from core.kernel.invariants import assert_not_none
 from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
+from core.typing import UnixMillis
 
 
 class HealthStatus(Enum):

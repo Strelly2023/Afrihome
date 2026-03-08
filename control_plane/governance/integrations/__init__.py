@@ -11,11 +11,16 @@ Notes:
 - Infrastructure layer will handle HTTP, crypto, retries, and persistence.
 """
 
-from .provider_config import ProviderConfig, ProviderKind, normalize_provider_key, normalize_namespace_key
+from .provider_config import (
+    ProviderConfig,
+    ProviderKind,
+    normalize_namespace_key,
+    normalize_provider_key,
+)
 from .webhook_verification import (
-    WebhookVerification,
     HttpMethod,
     SignatureAlgorithm,
+    WebhookVerification,
     normalize_header_name,
     normalize_path,
 )

@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Health (In-Memory, Deterministic)
 
@@ -14,19 +13,24 @@ Notes:
 - Deterministic ordering (registration order).
 """
 
-from .registry import (
-    HealthStatus,
-    HealthCheckResult,
-    HealthCheck,
-    HealthRegistry,
-)
 from .diagnostics import (
     DiagnosticReport,
-    summarize_status,
     run_diagnostics,
+    summarize_status,
+)
+from .registry import (
+    HealthCheck,
+    HealthCheckResult,
+    HealthRegistry,
+    HealthStatus,
 )
 
 __all__ = [
-    "HealthStatus", "HealthCheckResult", "HealthCheck", "HealthRegistry",
-    "DiagnosticReport", "summarize_status", "run_diagnostics",
+    "HealthStatus",
+    "HealthCheckResult",
+    "HealthCheck",
+    "HealthRegistry",
+    "DiagnosticReport",
+    "summarize_status",
+    "run_diagnostics",
 ]

@@ -1,14 +1,12 @@
 from dataclasses import dataclass
-from typing import Optional
 
+from control_plane.governance.tenants.tenant import Tenant
+from control_plane.governance.tenants.tenant_id import TenantId
+from control_plane.repositories.tenant_repository import TenantRepository
+from core.errors import InvariantViolationError
 from core.execution.execution_context import ExecutionContext
 from core.execution.transaction import TransactionBoundary
-from core.errors import InvariantViolationError
 from core.typing import UnixMillis
-
-from control_plane.governance.tenants.tenant_id import TenantId
-from control_plane.governance.tenants.tenant import Tenant
-from control_plane.repositories.tenant_repository import TenantRepository
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +18,7 @@ class TenantService:
     - All writes must be within a TransactionBoundary (write_mode)
     - Time and UUIDs are injected from core (ctx.clock / ctx.uuid_provider)
     """
+
     ctx: ExecutionContext
     repo: TenantRepository
 

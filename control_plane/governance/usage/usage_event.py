@@ -1,15 +1,15 @@
+import re
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-import re
-from core.typing import UnixMillis, TenantId, UserId
-from core.errors import InvariantViolationError
 from control_plane.governance.features.feature_flag import normalize_feature_key
 from control_plane.governance.features.flag_rule import ActorKind
+from core.errors import InvariantViolationError
+from core.typing import TenantId, UnixMillis, UserId
 
 # Canonical metric key grammar (same shape as feature keys)
-#_METRIC_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
-_METRIC_KEY_RE = re.compile(r'^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$')
+# _METRIC_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+_METRIC_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 
 
 def normalize_metric_key(key: str) -> str:
@@ -39,6 +39,7 @@ class UsageEvent:
     - No I/O or id generation here.
     - Keep tags small and deterministic (sorted externally or before construction, if needed).
     """
+
     feature_key: str
     metric_key: str
     quantity: int

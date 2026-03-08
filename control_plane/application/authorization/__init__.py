@@ -8,12 +8,15 @@ Exports:
 - PolicyProvider, GovernancePolicy
 - AuthorizationService
 """
+
 from .models import AccessDecision, DecisionStage
-from .policies import PolicyProvider, GovernancePolicy
+from .policies import GovernancePolicy, PolicyProvider
 from .service import AuthorizationService
 
 __all__ = [
-    "AccessDecision", "DecisionStage",
-    "PolicyProvider", "GovernancePolicy",
+    "AccessDecision",
+    "DecisionStage",
+    "PolicyProvider",
+    "GovernancePolicy",
     "AuthorizationService",
 ]

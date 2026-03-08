@@ -1,18 +1,22 @@
 from dataclasses import dataclass
-from typing import Optional, Mapping, Any
-from core.typing import UnixMillis, TenantId
-from core.kernel.invariants import assert_not_none
+from typing import Any, Mapping, Optional
+
 from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
+from core.typing import TenantId, UnixMillis
+
 from .audit_action import AuditAction
+
 
 @dataclass(frozen=True, slots=True)
 class AuditEvent:
     """
     Pure audit intent (no persistence details).
     """
+
     ts: UnixMillis
     tenant_id: Optional[TenantId]
-    principal: Optional[str]       # user id, api key id, operator id, etc.
+    principal: Optional[str]  # user id, api key id, operator id, etc.
     action: AuditAction
     data: Mapping[str, Any]
 

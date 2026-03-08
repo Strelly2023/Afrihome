@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Outbox Writer
 ----------------------------------
@@ -14,11 +13,10 @@ Dependencies:
 IO: NONE
 """
 
-
-from core.outbox.topic_grammar import validate_topic
+from core.events.envelope import EventEnvelope
 from core.outbox.model import OutboxRecord
 from core.outbox.store_protocol import OutboxStore
-from core.events.envelope import EventEnvelope
+from core.outbox.topic_grammar import validate_topic
 from core.typing import UnixMillis
 
 

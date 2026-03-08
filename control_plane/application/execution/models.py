@@ -1,11 +1,19 @@
-#control_plane/application/execution/models.py
+# control_plane/application/execution/models.py
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any, Mapping, Optional, Tuple
+
 from core.execution import ExecutionContext
 from core.typing import (
-    TenantId, UserId, RequestId, CorrelationId, CausationId, UnixMillis, RoleName
+    CausationId,
+    CorrelationId,
+    RequestId,
+    RoleName,
+    TenantId,
+    UnixMillis,
+    UserId,
 )
+
 
 class ActorKind(Enum):
     USER = auto()
@@ -13,15 +21,18 @@ class ActorKind(Enum):
     SYSTEM = auto()
     OPERATOR = auto()
 
+
 @dataclass(frozen=True, slots=True)
 class Actor:
     """
     Pure, immutable actor snapshot (no RBAC resolution here).
     """
+
     kind: ActorKind
     user_id: Optional[UserId] = None
     roles: Tuple[RoleName, ...] = ()
     principal: Optional[str] = None  # opaque identifier (e.g., api key id, service name)
+
 
 @dataclass(frozen=True, slots=True)
 class ExecutionFrame:
@@ -34,6 +45,7 @@ class ExecutionFrame:
       - Opaque feature snapshot (pure governance value)
       - Normalized inbound headers (read-only)
     """
+
     ctx: ExecutionContext
 
     request_id: RequestId

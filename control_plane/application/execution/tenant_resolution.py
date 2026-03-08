@@ -1,16 +1,19 @@
-#control_plane/application/execution/tenant_resolution.py
+# control_plane/application/execution/tenant_resolution.py
 from typing import Mapping, Optional
-from core.typing import TenantId
+
+from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
 from core.tenancy import (
-    resolve_tenant_context_by_id,
-    resolve_tenant_context_by_slug,
     TenantContext,
     TenantResolver,
+    resolve_tenant_context_by_id,
+    resolve_tenant_context_by_slug,
     validate_tenant_slug,
 )
-from core.kernel.invariants import assert_not_none
-from core.errors import InvariantViolationError
+from core.typing import TenantId
+
 from .constants import HDR_TENANT_ID, HDR_TENANT_SLUG
+
 
 def resolve_tenant_context(headers: Mapping[str, str], resolver: TenantResolver) -> TenantContext:
     """

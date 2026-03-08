@@ -1,14 +1,13 @@
+import re
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Tuple, Optional, Mapping
-import re
+from typing import Optional, Tuple
 
 from core.errors import InvariantViolationError
 
-
 # Reuse a consistent grammar with features/plans: "a", "a.b", "a-b_c"
-#_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
-_KEY_RE = re.compile(r'^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$')
+# _KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 
 
 def normalize_template_key(key: str) -> str:
@@ -50,17 +49,18 @@ class NotificationTemplate:
         SMS     -> body_template required
         WEBHOOK -> payload_template required
     """
+
     template_key: str
     version: int
     channels: Tuple[Channel, ...]
 
     body_template: Optional[str] = None
-    subject_template: Optional[str] = None      # email-only
-    payload_template: Optional[str] = None      # webhook-only
+    subject_template: Optional[str] = None  # email-only
+    payload_template: Optional[str] = None  # webhook-only
 
     placeholders: Tuple[str, ...] = ()
     description: str = ""
-    locale: Optional[str] = None                # e.g., "en-US", "fr-FR"
+    locale: Optional[str] = None  # e.g., "en-US", "fr-FR"
 
     def __post_init__(self) -> None:
         k = normalize_template_key(self.template_key)
@@ -88,7 +88,9 @@ class NotificationTemplate:
         ph = tuple(self.placeholders)
         for p in ph:
             if not isinstance(p, str) or not p.strip() or p != p.strip().lower():
-                raise InvariantViolationError(f"invalid placeholder {p!r}; must be lowercase non-empty string")
+                raise InvariantViolationError(
+                    f"invalid placeholder {p!r}; must be lowercase non-empty string"
+                )
         object.__setattr__(self, "placeholders", ph)
 
         # Ensure placeholders appear somewhere in provided templates (governance safeguard)

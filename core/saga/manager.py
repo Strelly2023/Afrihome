@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Saga Manager (Pure Coordinator)
 ----------------------------------------------------
@@ -16,17 +15,16 @@ Rules:
 - Deterministic effects (pure data only)
 """
 
-
 from dataclasses import dataclass
-from typing import Mapping, Any, Tuple, List
+from typing import Any, List, Mapping, Tuple
 
+from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
 from core.saga.state import (
     SagaSnapshot,
     SagaStatus,
 )
 from core.typing import UnixMillis
-from core.kernel.invariants import assert_not_none
-from core.errors import InvariantViolationError
 
 
 class SagaSignal:
@@ -81,7 +79,9 @@ class SagaEffects:
 
 
 class SagaManager:
-    def apply(self, state: SagaSnapshot, signal: SagaSignal, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+    def apply(
+        self, state: SagaSnapshot, signal: SagaSignal, now_ms: UnixMillis
+    ) -> Tuple[SagaSnapshot, SagaEffects]:
         assert_not_none(state, "state")
         assert_not_none(signal, "signal")
         assert_not_none(now_ms, "now_ms")
@@ -104,33 +104,58 @@ class SagaManager:
         eff = SagaEffects.emit("saga.started", {"saga_id": str(s.saga_id), "ts": int(now_ms)})
         return ns, eff
 
-    def _step_succeeded(self, s: SagaSnapshot, name: str, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+    def _step_succeeded(
+        self, s: SagaSnapshot, name: str, now_ms: UnixMillis
+    ) -> Tuple[SagaSnapshot, SagaEffects]:
         ns = s.step_done(name, now_ms)
-        evt = SagaEffects.emit("saga.step.succeeded", {"saga_id": str(s.saga_id), "step": name, "ts": int(now_ms)})
+        evt = SagaEffects.emit(
+            "saga.step.succeeded", {"saga_id": str(s.saga_id), "step": name, "ts": int(now_ms)}
+        )
         if ns.status == SagaStatus.COMPLETED and s.status != SagaStatus.COMPLETED:
-            done = SagaEffects.emit("saga.completed", {"saga_id": str(s.saga_id), "ts": int(now_ms)})
+            done = SagaEffects.emit(
+                "saga.completed", {"saga_id": str(s.saga_id), "ts": int(now_ms)}
+            )
             return ns, SagaEffects.combine(evt, done)
         return ns, evt
 
-    def _step_failed(self, s: SagaSnapshot, name: str, error: str, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+    def _step_failed(
+        self, s: SagaSnapshot, name: str, error: str, now_ms: UnixMillis
+    ) -> Tuple[SagaSnapshot, SagaEffects]:
         ns = s.step_failed(name, error, now_ms)
-        evt = SagaEffects.emit("saga.step.failed", {"saga_id": str(s.saga_id), "step": name, "error": error, "ts": int(now_ms)})
+        evt = SagaEffects.emit(
+            "saga.step.failed",
+            {"saga_id": str(s.saga_id), "step": name, "error": error, "ts": int(now_ms)},
+        )
         return ns, evt
 
-    def _begin_compensation(self, s: SagaSnapshot, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+    def _begin_compensation(
+        self, s: SagaSnapshot, now_ms: UnixMillis
+    ) -> Tuple[SagaSnapshot, SagaEffects]:
         ns = s.begin_compensation(now_ms)
-        evt = SagaEffects.emit("saga.compensation.started", {"saga_id": str(s.saga_id), "ts": int(now_ms)})
+        evt = SagaEffects.emit(
+            "saga.compensation.started", {"saga_id": str(s.saga_id), "ts": int(now_ms)}
+        )
         return ns, evt
 
-    def _step_compensated(self, s: SagaSnapshot, name: str, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+    def _step_compensated(
+        self, s: SagaSnapshot, name: str, now_ms: UnixMillis
+    ) -> Tuple[SagaSnapshot, SagaEffects]:
         ns = s.step_compensated(name, now_ms)
-        evt = SagaEffects.emit("saga.step.compensated", {"saga_id": str(s.saga_id), "step": name, "ts": int(now_ms)})
+        evt = SagaEffects.emit(
+            "saga.step.compensated", {"saga_id": str(s.saga_id), "step": name, "ts": int(now_ms)}
+        )
         if ns.status == SagaStatus.COMPLETED and s.status != SagaStatus.COMPLETED:
-            done = SagaEffects.emit("saga.completed", {"saga_id": str(s.saga_id), "ts": int(now_ms)})
+            done = SagaEffects.emit(
+                "saga.completed", {"saga_id": str(s.saga_id), "ts": int(now_ms)}
+            )
             return ns, SagaEffects.combine(evt, done)
         return ns, evt
 
-    def _abort(self, s: SagaSnapshot, reason: str, now_ms: UnixMillis) -> Tuple[SagaSnapshot, SagaEffects]:
+    def _abort(
+        self, s: SagaSnapshot, reason: str, now_ms: UnixMillis
+    ) -> Tuple[SagaSnapshot, SagaEffects]:
         ns = s._with(status=SagaStatus.FAILED, updated_ms=now_ms, error=reason)
-        evt = SagaEffects.emit("saga.aborted", {"saga_id": str(s.saga_id), "reason": reason, "ts": int(now_ms)})
+        evt = SagaEffects.emit(
+            "saga.aborted", {"saga_id": str(s.saga_id), "reason": reason, "ts": int(now_ms)}
+        )
         return ns, evt

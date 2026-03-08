@@ -1,8 +1,21 @@
+# control_plane/application/event_handlers/builder.py
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Mapping, Any
-from core.events import DomainEvent, EventHeaders, EventEnvelope
-from core.typing import TenantId, CorrelationId, CausationId, UnixMillis
+from typing import Any, Mapping, Protocol
+
+# DROP EventId from this import:
+# from core.events import DomainEvent, EventHeaders, EventEnvelope, EventId
+from core.events import DomainEvent, EventEnvelope, EventHeaders  # <- keep these three
 from core.kernel.invariants import assert_not_none
+from core.typing import CausationId, CorrelationId, TenantId, UnixMillis
+
+
+class UuidFactory(Protocol):
+    """Callable that returns a new event id object (type is intentionally generic for decoupling)."""
+
+    def __call__(self) -> object: ...  # <- was EventId; typing-only change
+
 
 @dataclass(frozen=True, slots=True)
 class EventBuilder:
@@ -10,7 +23,14 @@ class EventBuilder:
     Deterministic factory for outbound envelopes.
     Uses injected IDs/time and caller-provided payload. No IO.
     """
+
     event_type: str
+
+    def __post_init__(self) -> None:
+        et = (self.event_type or "").strip()
+        if not et:
+            raise ValueError("event_type must be a non-empty string")
+        object.__setattr__(self, "event_type", et)
 
     def build(
         self,
@@ -19,7 +39,7 @@ class EventBuilder:
         correlation_id: CorrelationId,
         causation_id: CausationId,
         timestamp_ms: UnixMillis,
-        uuid_new_event_id,  # function: () -> EventId (kept generic to avoid concrete provider coupling)
+        uuid_new_event_id: UuidFactory,  # () -> object; avoids concrete provider coupling
         payload: Mapping[str, Any],
     ) -> EventEnvelope:
         assert_not_none(tenant_id, "tenant_id")

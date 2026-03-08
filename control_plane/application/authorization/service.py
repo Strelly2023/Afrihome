@@ -1,14 +1,17 @@
 from dataclasses import dataclass
-from typing import Iterable, Tuple
-from core.kernel.invariants import assert_not_none
-from core.errors import AuthorizationError, GrammarViolationError
-from core.rbac.policy_engine import evaluate as rbac_evaluate  # deny-wins engine
-from core.rbac.grammar import validate_permission_name
-from core.typing import Permission, RoleName
+from typing import Tuple
+
 from control_plane.application.actors.service import ActorService
 from control_plane.application.execution.models import ExecutionFrame
+from core.errors import AuthorizationError, GrammarViolationError
+from core.kernel.invariants import assert_not_none
+from core.rbac.grammar import validate_permission_name
+from core.rbac.policy_engine import evaluate as rbac_evaluate  # deny-wins engine
+from core.typing import Permission
+
 from .models import AccessDecision, DecisionStage
-from .policies import PolicyProvider, GovernancePolicy
+from .policies import GovernancePolicy, PolicyProvider
+
 
 @dataclass(frozen=True, slots=True)
 class AuthorizationService:
@@ -19,6 +22,7 @@ class AuthorizationService:
       3) Evaluate RBAC policy (deny-wins engine)
       4) Default deny if no allow matched
     """
+
     policy_provider: PolicyProvider
     governance_policies: Tuple[GovernancePolicy, ...] = ()
 

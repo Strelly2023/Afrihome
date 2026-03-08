@@ -1,12 +1,15 @@
-#control_plane/application/actors/service.py
+# control_plane/application/actors/service.py
 from dataclasses import dataclass
 from typing import Mapping, Tuple
-from core.kernel.invariants import assert_not_none
+
 from core.errors import ValidationError
+from core.kernel.invariants import assert_not_none
 from core.rbac.policy_engine import Subject  # types only; no evaluation here
 from core.typing import RoleName, UserId
-from .models import Actor, ActorKind
+
 from .mapping import map_headers_to_actor
+from .models import Actor, ActorKind
+
 
 @dataclass(frozen=True, slots=True)
 class ActorService:
@@ -63,7 +66,9 @@ class ActorService:
         return actor.user_id
 
     @staticmethod
-    def effective_roles(actor: Actor, *, default: Tuple[RoleName, ...] = ()) -> Tuple[RoleName, ...]:
+    def effective_roles(
+        actor: Actor, *, default: Tuple[RoleName, ...] = ()
+    ) -> Tuple[RoleName, ...]:
         """
         Return the actor's roles or provided defaults (deterministically
         preserving order and uniqueness).

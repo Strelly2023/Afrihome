@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Core Registry Facade
 -----------------------------------------
@@ -15,11 +14,10 @@ Notes:
 - Still no globals — caller constructs CoreRegistry where needed.
 """
 
-
 from dataclasses import dataclass
 
-from core.registry.services import ServiceRegistry
 from core.registry.handlers import HandlerRegistry
+from core.registry.services import ServiceRegistry
 
 
 @dataclass(frozen=True, slots=True)

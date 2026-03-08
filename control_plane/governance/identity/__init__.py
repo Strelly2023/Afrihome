@@ -11,11 +11,12 @@ Contains:
 - User (immutable aggregate; tenant-scoped identity with roles & direct grants)
 - Identity invariants (email/display name validation)
 """
-from .user_id import UserId
+
+from .identity_invariants import normalize_display_name, validate_email
 from .permission import Permission
 from .role import Role
 from .user import User
-from .identity_invariants import validate_email, normalize_display_name
+from .user_id import UserId
 
 __all__ = [
     "UserId",

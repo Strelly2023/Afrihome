@@ -18,9 +18,9 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
 
-from core.typing import UnixMillis
 from core.errors import InvariantViolationError
 from core.kernel.invariants import assert_not_none
+from core.typing import UnixMillis
 
 
 class IdempotencyStatus(Enum):
@@ -127,9 +127,7 @@ def idempotency_reject(
     )
 
 
-def is_replay_of(
-    existing: Optional[IdempotencyRecord], *, response_hash: str | None
-) -> bool:
+def is_replay_of(existing: Optional[IdempotencyRecord], *, response_hash: str | None) -> bool:
     """
     Returns True if:
       - a previous COMPLETED record exists, and

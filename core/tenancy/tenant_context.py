@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Tenant Context (Immutable)
 -----------------------------------------------
@@ -15,13 +14,12 @@ Rules:
 - Deterministic
 """
 
-
 from dataclasses import dataclass
 from typing import Optional
 
-from core.typing import TenantId
-from core.tenancy.tenant import Tenant
 from core.kernel.invariants import assert_not_none
+from core.tenancy.tenant import Tenant
+from core.typing import TenantId
 
 
 @dataclass(frozen=True, slots=True)

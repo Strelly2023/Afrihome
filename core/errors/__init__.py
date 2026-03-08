@@ -1,14 +1,13 @@
-
 from .base import (
-    CoreError,
-    KernelFrozenError,
-    InvariantViolationError,
-    ValidationError,
-    GrammarViolationError,
     AuthorizationError,
-    TenantIsolationError,
-    StrictWriteViolationError,
+    CoreError,
+    GrammarViolationError,
     IdempotencyViolationError,
+    InvariantViolationError,
+    KernelFrozenError,
+    StrictWriteViolationError,
+    TenantIsolationError,
+    ValidationError,
 )
 
 __all__ = [

@@ -6,7 +6,10 @@ from pathlib import Path
 # ------------------------------------------------------------------
 # Paths
 # ------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parents[2]   # /config/settings/base.py → up 2 levels to project root
+BASE_DIR = (
+    Path(__file__).resolve().parents[2]
+)  # /config/settings/base.py → up 2 levels to project root
+
 
 # ------------------------------------------------------------------
 # Environment
@@ -17,11 +20,13 @@ def env_str(name: str, default: str | None = None) -> str:
         raise RuntimeError(f"Missing required env var: {name}")
     return val
 
+
 def env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
     return v.lower() in ("1", "true", "yes", "on")
+
 
 def env_int(name: str, default: int | None = None) -> int:
     v = os.getenv(name)
@@ -30,6 +35,7 @@ def env_int(name: str, default: int | None = None) -> int:
             raise RuntimeError(f"Missing required env var: {name}")
         return default
     return int(v)
+
 
 # ------------------------------------------------------------------
 # Core Django
@@ -48,7 +54,6 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-
     # === AfriHome Platform (Phase 0 governance-first; no product domains here)
     # Wire platform orchestrators; their infra adapters live elsewhere.
     # You can add your app configs, e.g.:
@@ -69,7 +74,6 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-
     # === AfriHome: bind ExecutionContext per request (tenant + actor)
     # implemented in platform/api/middleware.py (see below)
     # "control_plane.api.middleware.ExecutionContextMiddleware",
@@ -125,7 +129,10 @@ else:
 # ------------------------------------------------------------------
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
-    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator", "OPTIONS": {"min_length": 12}},
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 12},
+    },
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
@@ -142,7 +149,7 @@ USE_TZ = True
 # Static/Media (infra adapters wire storage later)
 # ------------------------------------------------------------------
 STATIC_URL = "/static/"
-STATIC_ROOT = str(BASE_DIR / ".static")   # Collectstatic for prod
+STATIC_ROOT = str(BASE_DIR / ".static")  # Collectstatic for prod
 MEDIA_URL = "/media/"
 MEDIA_ROOT = str(BASE_DIR / ".media")
 
@@ -152,7 +159,9 @@ MEDIA_ROOT = str(BASE_DIR / ".media")
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SESSION_COOKIE_SECURE = env_bool("SESSION_COOKIE_SECURE", not DEBUG)
 CSRF_COOKIE_SECURE = env_bool("CSRF_COOKIE_SECURE", not DEBUG)
-CSRF_TRUSTED_ORIGINS = os.getenv("CSRF_TRUSTED_ORIGINS", "").split(",") if os.getenv("CSRF_TRUSTED_ORIGINS") else []
+CSRF_TRUSTED_ORIGINS = (
+    os.getenv("CSRF_TRUSTED_ORIGINS", "").split(",") if os.getenv("CSRF_TRUSTED_ORIGINS") else []
+)
 X_FRAME_OPTIONS = "DENY"
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_BROWSER_XSS_FILTER = True
@@ -199,4 +208,4 @@ PLATFORM_EVENTS_ENABLED = env_bool("PLATFORM_EVENTS_ENABLED", True)
 
 # Example: execution middleware options
 EXECUTION_CONTEXT_HEADER_TENANT = os.getenv("EXEC_CTX_TENANT_HEADER", "X-AfriHome-Tenant")
-EXECUTION_CONTEXT_HEADER_ACTOR  = os.getenv("EXEC_CTX_ACTOR_HEADER", "X-AfriHome-Actor")
+EXECUTION_CONTEXT_HEADER_ACTOR = os.getenv("EXEC_CTX_ACTOR_HEADER", "X-AfriHome-Actor")

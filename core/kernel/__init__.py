@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Kernel Authority
 
@@ -9,11 +8,10 @@ Purpose:
 """
 
 from .freeze import (
+    assert_kernel_mutable,
     freeze_kernel,
     is_kernel_frozen,
-    assert_kernel_mutable,
 )
-
 from .invariants import (
     assert_invariant,
     assert_not_none,
@@ -21,6 +19,10 @@ from .invariants import (
 )
 
 __all__ = [
-    "freeze_kernel", "is_kernel_frozen", "assert_kernel_mutable",
-    "assert_invariant", "assert_not_none", "assert_true",
+    "freeze_kernel",
+    "is_kernel_frozen",
+    "assert_kernel_mutable",
+    "assert_invariant",
+    "assert_not_none",
+    "assert_true",
 ]

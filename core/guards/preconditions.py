@@ -14,15 +14,17 @@ Rules:
 
 from typing import Any, Type
 
-from core.kernel.invariants import assert_not_none
 from core.errors import (
+    AuthorizationError,
     InvariantViolationError,
     ValidationError,
-    AuthorizationError,
 )
+from core.kernel.invariants import assert_not_none
 
 
-def require(condition: bool, message: str, *, error: Type[Exception] = InvariantViolationError) -> None:
+def require(
+    condition: bool, message: str, *, error: Type[Exception] = InvariantViolationError
+) -> None:
     """
     Enforce an arbitrary boolean precondition.
     On failure, raises the provided deterministic error type (defaults to InvariantViolationError).

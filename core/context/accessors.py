@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Context Accessors
 --------------------------------------
@@ -13,15 +12,14 @@ Purpose:
 - Prevent silent None usage
 """
 
-
 from core.context.request_context import RequestContext
+from core.errors import InvariantViolationError
 from core.typing import (
+    CorrelationId,
+    RequestId,
     TenantId,
     UserId,
-    RequestId,
-    CorrelationId,
 )
-from core.errors import InvariantViolationError
 
 
 def require_tenant_id(ctx: RequestContext) -> TenantId:

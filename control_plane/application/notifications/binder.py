@@ -1,7 +1,9 @@
 from dataclasses import dataclass
-from typing import Mapping, Any, Optional
+from typing import Any, Mapping, Optional
+
+from control_plane.governance.notifications.models import RenderedMessage
 from core.errors import ValidationError
-from .models import RenderedMessage
+
 
 @dataclass(frozen=True, slots=True)
 class DefaultTemplateBinder:
@@ -32,6 +34,8 @@ class DefaultTemplateBinder:
         variables: Mapping[str, Any],
     ) -> RenderedMessage:
         subj = self._fmt(template_payload.get("subject"), variables)
-        txt  = self._fmt(template_payload.get("body_text"), variables)
+        txt = self._fmt(template_payload.get("body_text"), variables)
         html = self._fmt(template_payload.get("body_html"), variables)
-        return RenderedMessage(subject=subj, body_text=txt, body_html=html, variables=dict(variables))
+        return RenderedMessage(
+            subject=subj, body_text=txt, body_html=html, variables=dict(variables)
+        )

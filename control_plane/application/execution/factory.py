@@ -1,14 +1,17 @@
-#control_plane/application/execution/factory.py
-from typing import Mapping, Dict
-from core.time.clock import Clock
+# control_plane/application/execution/factory.py
+from typing import Dict, Mapping
+
 from core.identity.uuid import UUIDProvider
-from core.tenancy import TenantResolver
 from core.kernel.invariants import assert_not_none
-from .models import ExecutionFrame
-from .context_factory import build_request_context, new_execution_context
-from .tenant_resolution import resolve_tenant_context
+from core.tenancy import TenantResolver
+from core.time.clock import Clock
+
 from .actor_resolution import map_headers_to_actor
+from .context_factory import build_request_context, new_execution_context
 from .feature_snapshot import FeatureSnapshotProvider, get_feature_snapshot
+from .models import ExecutionFrame
+from .tenant_resolution import resolve_tenant_context
+
 
 def _normalize_headers(headers: Mapping[str, str]) -> Dict[str, str]:
     return {
@@ -16,6 +19,7 @@ def _normalize_headers(headers: Mapping[str, str]) -> Dict[str, str]:
         for k, v in headers.items()
         if isinstance(k, str) and isinstance(v, str)
     }
+
 
 def open_execution_frame(
     *,

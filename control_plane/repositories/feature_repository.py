@@ -1,8 +1,7 @@
-from typing import Protocol, Any
+from typing import Any, Iterable, Optional, Protocol
+
 from control_plane.governance.features.feature_flag import FeatureFlag
 from core.typing import TenantId
-from typing import Protocol, Optional, runtime_checkable, Iterable
-
 
 
 class FeatureRepository(Protocol):
@@ -10,6 +9,7 @@ class FeatureRepository(Protocol):
     Returns an opaque, immutable feature snapshot for a tenant.
     Application layer treats this as an opaque value (no mutation here).
     """
+
     def snapshot_for(self, tenant_id: TenantId) -> Any: ...
 
     """

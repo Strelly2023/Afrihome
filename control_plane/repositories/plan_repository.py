@@ -1,12 +1,13 @@
-from typing import Protocol, Optional, Tuple
+from typing import Iterable, Optional, Protocol, Tuple
+
 from control_plane.governance.plans.plan import Plan  # adjust path if needed
-from typing import Protocol, Optional, runtime_checkable, Iterable
 
 
 class PlanRepository(Protocol):
     """
     Plans catalog (governance).
     """
+
     def get(self, plan_id: str) -> Optional[Plan]: ...
     def list(self, *, limit: int = 100, offset: int = 0) -> Tuple[Plan, ...]: ...
 

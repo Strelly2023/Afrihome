@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 from typing import Tuple
 
+from core.rbac.grammar import validate_permission_pattern, validate_role_name
 from core.typing import RoleName
-from core.rbac.grammar import validate_role_name, validate_permission_pattern
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +17,7 @@ class Role:
     - This is a governance VO; evaluation lives in core.rbac or application.auth.
     - Use with deny-wins PolicyEngine when enforcing permissions.
     """
+
     name: RoleName
     allow: Tuple[str, ...] = ()
     deny: Tuple[str, ...] = ()

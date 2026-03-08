@@ -1,10 +1,13 @@
-#control_plane/application/actors/models.py
+# control_plane/application/actors/models.py
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional, Tuple
-from core.typing import UserId, RoleName
+
+from core.typing import RoleName, UserId
+
 # Pure, immutable, and deterministic data shapes — consistent with core style.  # noqa
 # (No IO, no side effects.)                                                     # noqa
+
 
 class ActorKind(Enum):
     USER = auto()
@@ -12,12 +15,14 @@ class ActorKind(Enum):
     SYSTEM = auto()
     OPERATOR = auto()
 
+
 @dataclass(frozen=True, slots=True)
 class Actor:
     """
     Immutable actor surface used across application services.
     NOTE: No RBAC decisioning lives here; this module only maps inputs to identity.
     """
+
     kind: ActorKind
     user_id: Optional[UserId] = None
     roles: Tuple[RoleName, ...] = ()

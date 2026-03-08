@@ -1,15 +1,18 @@
-from typing import Protocol, Mapping, Any, Optional
-from control_plane.application.notifications.models import TemplateRef  # app model is pure
-from typing import Protocol, Optional, runtime_checkable, Iterable
+# from control_plane.application.notifications.models import TemplateRef  # app model is pure
+from typing import Any, Iterable, Mapping, Optional, Protocol
 
+from control_plane.governance.notifications.models import TemplateRef
 from control_plane.governance.notifications.template import NotificationTemplate
+
 
 class NotificationRepository(Protocol):
     """
     Template repository port for notifications (no IO here).
     Application binder uses this port; infra implements it.
     """
+
     def get_template(self, ref: TemplateRef) -> Optional[Mapping[str, Any]]: ...
+
     """
     Templates repository (versioned per key if you choose to support that).
     """

@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — In-Process Event Bus
 -----------------------------------------
@@ -15,13 +14,11 @@ Rules:
 - Deterministic ordering
 """
 
-
 from collections import defaultdict
 from typing import Callable, Dict, List
 
 from core.events.envelope import EventEnvelope
 from core.kernel.invariants import assert_not_none
-
 
 EventHandler = Callable[[EventEnvelope], None]
 

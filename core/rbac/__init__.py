@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — RBAC (Deterministic, Deny-Wins)
 
@@ -13,24 +12,24 @@ Purpose:
 """
 
 from .grammar import (
-    ROLE_NAME_PATTERN,
     PERMISSION_NAME_PATTERN,
     PERMISSION_PATTERN_PATTERN,
-    normalize_role_name,
+    ROLE_NAME_PATTERN,
     normalize_permission_name,
-    validate_role_name,
+    normalize_role_name,
     validate_permission_name,
     validate_permission_pattern,
+    validate_role_name,
 )
 from .permissions import permission_matches
-from .roles import Role
 from .policy_engine import (
-    Subject,
-    Policy,
     Decision,
+    Policy,
     PolicyEngine,
+    Subject,
     evaluate,
 )
+from .roles import Role
 
 __all__ = [
     "ROLE_NAME_PATTERN",

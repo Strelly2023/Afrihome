@@ -1,8 +1,10 @@
-#control_plane/application/execution/feature_snapshot.py
+# control_plane/application/execution/feature_snapshot.py
 
-from typing import Protocol, runtime_checkable, Any
-from core.typing import TenantId, UnixMillis
+from typing import Any, Protocol, runtime_checkable
+
 from core.kernel.invariants import assert_not_none
+from core.typing import TenantId, UnixMillis
+
 
 @runtime_checkable
 class FeatureSnapshotProvider(Protocol):
@@ -10,9 +12,13 @@ class FeatureSnapshotProvider(Protocol):
     Pure provider protocol (no IO here). Infrastructure binds a concrete
     implementation later via repositories/adapters and bootstrap.
     """
+
     def snapshot_for(self, tenant_id: TenantId, at_ms: UnixMillis) -> Any: ...
 
-def get_feature_snapshot(provider: FeatureSnapshotProvider, tenant_id: TenantId, now_ms: UnixMillis) -> Any:
+
+def get_feature_snapshot(
+    provider: FeatureSnapshotProvider, tenant_id: TenantId, now_ms: UnixMillis
+) -> Any:
     assert_not_none(provider, "provider")
     assert_not_none(tenant_id, "tenant_id")
     assert_not_none(now_ms, "now_ms")

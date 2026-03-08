@@ -1,11 +1,14 @@
 from dataclasses import dataclass
-from typing import Mapping, Any
-from core.kernel.invariants import assert_not_none
-from core.errors import ValidationError
-from core.typing import UnixMillis
+from typing import Any, Mapping
+
 from control_plane.application.execution.models import ExecutionFrame
+from core.errors import ValidationError
+from core.kernel.invariants import assert_not_none
+from core.typing import UnixMillis
+
+from .models import DecisionSource, FeatureDecision
 from .protocols import FeatureRuleEvaluator
-from .models import FeatureDecision, DecisionSource
+
 
 @dataclass(frozen=True, slots=True)
 class RuleResolver:
@@ -13,6 +16,7 @@ class RuleResolver:
     Deterministically resolves a feature decision using a pure FeatureRuleEvaluator.
     No IO, no storage, no business logic here—just orchestration.
     """
+
     evaluator: FeatureRuleEvaluator
 
     def evaluate(

@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Deterministic Typing Primitives
 ----------------------------------------------------
@@ -14,7 +13,6 @@ Rules:
 - No dynamic type factories
 - Protocol-first design
 """
-
 
 from dataclasses import dataclass
 from typing import (
@@ -64,12 +62,14 @@ ID_co = TypeVar("ID_co", covariant=True)
 # Protocol Foundations
 # ============================================================
 
+
 @runtime_checkable
 class Identifiable(Protocol[ID_co]):
     """
     Protocol for entities that expose an ID.
     Keeps the field name stable for ergonomics in the core.
     """
+
     id: ID_co
 
 
@@ -78,6 +78,7 @@ class Versioned(Protocol):
     """
     Protocol for version-controlled entities.
     """
+
     version: Version
 
 
@@ -89,11 +90,14 @@ class Serializable(Protocol):
     Implementations should return a JSON-serializable mapping.
     The caller may normalize keys and order when hashing (e.g., via a stable dumper).
     """
+
     def to_dict(self) -> Mapping[str, Any]: ...
+
 
 # ============================================================
 # Frozen Model Base
 # ============================================================
+
 
 @dataclass(frozen=True, slots=True)
 class FrozenModel:
@@ -109,7 +113,9 @@ class FrozenModel:
     - Subclasses should avoid storing non-deterministic values at init time.
     - Prefer pure data + explicit injected dependencies in higher layers.
     """
+
     pass
+
 
 # ============================================================
 # Deterministic Constants

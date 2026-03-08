@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Audit Writer
 ---------------------------------
@@ -15,7 +14,6 @@ Rules:
 - Deterministic hashing
 - Pure state transitions
 """
-
 
 from core.audit.audit_record import AuditRecord
 from core.audit.chain import ChainLink, make_chain_link

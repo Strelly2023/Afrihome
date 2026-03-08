@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Deterministic Event Envelope
 -------------------------------------------------
@@ -14,7 +13,6 @@ Rules:
 - Deterministic hash
 - Canonical JSON encoding
 """
-
 
 import hashlib
 import json

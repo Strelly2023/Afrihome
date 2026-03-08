@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 
 from core.identity.uuid import UUIDProvider
-from core.typing import TenantId as CoreTenantId, AggregateId
+from core.typing import AggregateId
+from core.typing import TenantId as CoreTenantId
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +14,7 @@ class TenantId:
     - Compatible with core.typing.TenantId
     - Optional deterministic factory using UUIDProvider
     """
+
     value: str
 
     def __post_init__(self) -> None:

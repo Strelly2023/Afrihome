@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Registry Scopes
 ------------------------------------
@@ -15,7 +14,6 @@ Scopes:
 Resolution precedence:
 REQUEST → TENANT → APPLICATION → PROCESS
 """
-
 
 from enum import Enum, auto
 from typing import Tuple
@@ -34,6 +32,7 @@ DEFAULT_SCOPE_CHAIN: Tuple[RegistryScope, ...] = (
     RegistryScope.APPLICATION,
     RegistryScope.PROCESS,
 )
+
 
 def scope_rank(scope: RegistryScope) -> int:
     return DEFAULT_SCOPE_CHAIN.index(scope)

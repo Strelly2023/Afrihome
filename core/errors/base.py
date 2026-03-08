@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Deterministic Error Hierarchy
 --------------------------------------------------
@@ -17,14 +16,13 @@ Rules:
 - No side effects.
 """
 
-
 from dataclasses import dataclass
 from typing import Optional
-
 
 # ============================================================
 # Base Error
 # ============================================================
+
 
 @dataclass(frozen=True, slots=True)
 class CoreError(Exception):
@@ -56,6 +54,7 @@ class CoreError(Exception):
 # Kernel Errors
 # ============================================================
 
+
 class KernelFrozenError(CoreError):
     """Raised when mutation occurs after kernel freeze."""
 
@@ -73,6 +72,7 @@ class InvariantViolationError(CoreError):
 # ============================================================
 # Validation Errors
 # ============================================================
+
 
 class ValidationError(CoreError):
     """Input or structural validation failure."""
@@ -92,6 +92,7 @@ class GrammarViolationError(CoreError):
 # Authorization / Governance
 # ============================================================
 
+
 class AuthorizationError(CoreError):
     """Raised when access control denies execution."""
 
@@ -109,6 +110,7 @@ class TenantIsolationError(CoreError):
 # ============================================================
 # Execution Discipline
 # ============================================================
+
 
 class StrictWriteViolationError(CoreError):
     """Raised when write operation occurs outside strict write-mode."""

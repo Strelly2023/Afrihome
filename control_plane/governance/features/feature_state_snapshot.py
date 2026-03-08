@@ -2,7 +2,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
 
-from core.typing import UnixMillis, TenantId, UserId
+from core.typing import TenantId, UnixMillis, UserId
+
 from .flag_rule import ActorKind
 
 
@@ -18,6 +19,7 @@ class FeatureStateSnapshot:
 
     Entirely pure; suitable for audit logs or caching at the application layer.
     """
+
     feature_key: str
     enabled: bool
     decision_source: DecisionSource

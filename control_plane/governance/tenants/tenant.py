@@ -1,8 +1,8 @@
 from dataclasses import dataclass, replace
 
-from core.typing import UnixMillis
 from core.errors import InvariantViolationError
 from core.tenancy.grammar import validate_tenant_slug
+from core.typing import UnixMillis
 
 from .tenant_id import TenantId
 
@@ -16,6 +16,7 @@ class Tenant:
     - Transitions return new instances
     - Timestamps are injected (UnixMillis)
     """
+
     tenant_id: TenantId
     slug: str
     data_region: str

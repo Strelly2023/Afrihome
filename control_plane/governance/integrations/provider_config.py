@@ -1,14 +1,14 @@
+import re
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional, Tuple
-import re
 from urllib.parse import urlparse
 
 from core.errors import InvariantViolationError
 
 # Canonical “key” grammar (consistent with features/plans/etc.)
-#_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
-_KEY_RE = re.compile(r'^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$')
+# _KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 
 
 def normalize_provider_key(key: str) -> str:
@@ -68,6 +68,7 @@ class ProviderConfig:
     - No secrets here (use opaque refs in app/infra layers).
     - No HTTP/SDK calls here (governance-only).
     """
+
     provider_key: str
     kind: "ProviderKind"
     display_name: str

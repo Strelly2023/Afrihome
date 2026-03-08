@@ -11,6 +11,7 @@ class PermissionPattern:
     - Validated/normalized by core.rbac.grammar (single authority)
     - Immutable VO, no side effects
     """
+
     pattern: str
 
     def __post_init__(self) -> None:

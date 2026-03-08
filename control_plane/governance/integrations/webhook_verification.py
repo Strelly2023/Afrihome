@@ -1,17 +1,16 @@
+import re
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Tuple, Optional
-import re
+from typing import Optional, Tuple
 
 from core.errors import InvariantViolationError
 
-
 # ---------- Grammar helpers ----------
 
-#_HEADER_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")  # canonical lower-case header
-#_PATH_RE = re.compile(r"^/[-a-zA-Z0-9._~/]*$")    # conservative path grammar
-_HEADER_RE = re.compile(r'^[a-z0-9][a-z0-9-]*$')  # canonical lower-case header
-_PATH_RE = re.compile(r'^/[-a-zA-Z0-9._~/]*$')    # conservative path grammar
+# _HEADER_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")  # canonical lower-case header
+# _PATH_RE = re.compile(r"^/[-a-zA-Z0-9._~/]*$")    # conservative path grammar
+_HEADER_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")  # canonical lower-case header
+_PATH_RE = re.compile(r"^/[-a-zA-Z0-9._~/]*$")  # conservative path grammar
 
 
 def normalize_header_name(name: str) -> str:
@@ -36,6 +35,7 @@ def normalize_path(path: str) -> str:
 
 # ---------- Enums (declarative only; no crypto here) ----------
 
+
 class HttpMethod(Enum):
     GET = auto()
     POST = auto()
@@ -50,6 +50,7 @@ class SignatureAlgorithm(Enum):
 
     NOTE: Governance-only. Application/infra will implement crypto.
     """
+
     HMAC_SHA256 = auto()
     HMAC_SHA512 = auto()
     RSA_SHA256 = auto()
@@ -75,6 +76,7 @@ class WebhookVerification:
     required_headers       : optional extra headers that MUST be present (normalized)
     description            : optional human note
     """
+
     provider_key: str
     path: str
     methods: Tuple[HttpMethod, ...]
@@ -122,7 +124,11 @@ class WebhookVerification:
 
         if any(not isinstance(h, str) for h in self.required_headers):
             raise InvariantViolationError("required_headers must be Tuple[str, ...]")
-        object.__setattr__(self, "required_headers", tuple(normalize_header_name(h) for h in self.required_headers))
+        object.__setattr__(
+            self, "required_headers", tuple(normalize_header_name(h) for h in self.required_headers)
+        )
 
         if not isinstance(self.secret_ref, str) or not self.secret_ref.strip():
-            raise InvariantViolationError("secret_ref must be a non-empty string (opaque reference)")
+            raise InvariantViolationError(
+                "secret_ref must be a non-empty string (opaque reference)"
+            )

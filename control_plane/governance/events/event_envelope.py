@@ -1,16 +1,22 @@
-import json, hashlib
+# control_plane/governance/events/event_envelope.py
+import hashlib
+import json
 from dataclasses import dataclass
-from typing import Mapping, Any, Optional
-from core.typing import CorrelationId, CausationId, UnixMillis, TenantId
+from typing import Optional
+
+from core.events import DomainEvent, EventEnvelope, EventHeaders  # core immutable envelope  # noqa
 from core.kernel.invariants import assert_not_none
-from core.events import DomainEvent, EventHeaders, EventEnvelope  # core immutable envelope  # noqa
+from core.typing import CausationId, CorrelationId, TenantId, UnixMillis
+
 from .platform_event import PlatformEvent
+
 
 @dataclass(frozen=True, slots=True)
 class PlatformEnvelope:
     """
     Governance-level envelope (pure). Can be converted into core.events.EventEnvelope.
     """
+
     event: PlatformEvent
     correlation_id: CorrelationId
     causation_id: CausationId
@@ -28,7 +34,11 @@ class PlatformEnvelope:
         """
         Convert into a core EventEnvelope using injected ID function (deterministic).
         """
-        de = DomainEvent(event_id=new_event_id(), event_type=self.event.type.name, payload=dict(self.event.payload))
+        de = DomainEvent(
+            event_id=new_event_id(),
+            event_type=self.event.type.name,
+            payload=dict(self.event.payload),
+        )
         hdr = EventHeaders(
             correlation_id=self.correlation_id,
             causation_id=self.causation_id,

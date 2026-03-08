@@ -1,7 +1,7 @@
+import hashlib
 from dataclasses import dataclass
 from enum import Enum, auto
-import hashlib
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 from core.typing import TenantId, UserId
 
@@ -41,6 +41,7 @@ class FlagRule:
       across categories, conditions are combined with AND (i.e. all specified categories must match).
     - Percentage applies only if ALL other specified conditions match, and it is evaluated deterministically using SHA-256.
     """
+
     rule_id: str
     priority: int
     effect: RuleEffect

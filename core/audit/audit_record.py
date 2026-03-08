@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Immutable Audit Record
 -------------------------------------------
@@ -15,15 +14,14 @@ Rules:
 - No IO, no randomness, no time reads here (timestamp injected)
 """
 
-
-import json
 import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-from core.typing import UnixMillis, TenantId, EventId
-from core.kernel.invariants import assert_not_none
 from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
+from core.typing import EventId, TenantId, UnixMillis
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,9 +71,14 @@ class AuditRecord:
         encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
         digest = hashlib.sha256(encoded).hexdigest()
         return AuditRecord(
-            ts=ts, category=category, action=action,
-            tenant_id=tenant_id, principal=principal, event_id=event_id,
-            data=data, content_hash=digest,
+            ts=ts,
+            category=category,
+            action=action,
+            tenant_id=tenant_id,
+            principal=principal,
+            event_id=event_id,
+            data=data,
+            content_hash=digest,
         )
 
     def to_dict(self) -> dict[str, Any]:

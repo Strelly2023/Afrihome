@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
+
 @dataclass(frozen=True, slots=True)
 class PolicyRule:
     """
@@ -11,6 +12,7 @@ class PolicyRule:
       3) optional 'entitlement_key'
       4) optional ABAC (subject/resource injected at call)
     """
+
     permission: str
     feature_key: Optional[str] = None
     entitlement_key: Optional[str] = None

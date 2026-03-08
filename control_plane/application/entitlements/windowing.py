@@ -1,9 +1,12 @@
+from calendar import monthrange
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from calendar import monthrange
+
 from core.errors import InvariantViolationError
 from core.kernel.invariants import assert_not_none
+
 from .protocols import WindowCalculator, WindowKind
+
 
 @dataclass(frozen=True, slots=True)
 class FixedWindowCalculator(WindowCalculator):
@@ -11,12 +14,16 @@ class FixedWindowCalculator(WindowCalculator):
     Deterministic, dependency-free window calculator.
     Uses UTC boundaries. No IO/ambient time; 'now_ms' is injected by caller.
     """
+
     def compute(self, *, now_ms: int, window: str) -> tuple[str, int, int]:
         assert_not_none(now_ms, "now_ms")
         if now_ms < 0:
             raise InvariantViolationError("now_ms cannot be negative")
         if window not in {
-            WindowKind.FIXED_MINUTE, WindowKind.FIXED_HOUR, WindowKind.FIXED_DAY, WindowKind.FIXED_MONTH
+            WindowKind.FIXED_MINUTE,
+            WindowKind.FIXED_HOUR,
+            WindowKind.FIXED_DAY,
+            WindowKind.FIXED_MONTH,
         }:
             raise InvariantViolationError(f"Unsupported window kind: {window!r}")
 

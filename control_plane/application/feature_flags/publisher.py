@@ -1,9 +1,12 @@
 from dataclasses import dataclass
-from typing import Mapping, Any
-from core.events import DomainEvent, EventHeaders, EventEnvelope
-from core.kernel.invariants import assert_not_none
+from typing import Any, Mapping
+
 from control_plane.application.execution.models import ExecutionFrame
+from core.events import DomainEvent, EventEnvelope, EventHeaders
+from core.kernel.invariants import assert_not_none
+
 from .protocols import FeatureSnapshotSerializer
+
 
 @dataclass(frozen=True, slots=True)
 class SnapshotPublisher:
@@ -12,9 +15,12 @@ class SnapshotPublisher:
     - No IO: the returned envelope can be persisted by later phases (e.g., outbox).
     - Deterministic: IDs and timestamp sourced from the ExecutionContext (injected).
     """
+
     topic: str = "features.snapshot"  # logical event type; routing defined later
 
-    def publish(self, frame: ExecutionFrame, serializer: FeatureSnapshotSerializer) -> EventEnvelope:
+    def publish(
+        self, frame: ExecutionFrame, serializer: FeatureSnapshotSerializer
+    ) -> EventEnvelope:
         assert_not_none(frame, "frame")
         assert_not_none(serializer, "serializer")
 

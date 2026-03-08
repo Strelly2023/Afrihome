@@ -10,9 +10,10 @@ Pure, deterministic feature-flag governance:
 No services/adapters/IO here. Application layer orchestrates, passes injected time/ids,
 and persists snapshots if needed.
 """
-from .flag_rule import FlagRule, ActorKind, RuleEffect
+
 from .feature_flag import FeatureFlag, Target, normalize_feature_key
-from .feature_state_snapshot import FeatureStateSnapshot, DecisionSource
+from .feature_state_snapshot import DecisionSource, FeatureStateSnapshot
+from .flag_rule import ActorKind, FlagRule, RuleEffect
 
 __all__ = [
     "ActorKind",

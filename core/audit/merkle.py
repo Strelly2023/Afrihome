@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Merkle Root
 --------------------------------
@@ -8,7 +7,6 @@ Dependencies: core.audit.chain (ZERO_HASH validation)
 IO: NONE
 Randomness: NONE
 """
-
 
 import hashlib
 from typing import List

@@ -1,25 +1,27 @@
 from dataclasses import dataclass
-from typing import Mapping, Optional, Any
-from core.kernel.invariants import assert_not_none
-from core.errors import ValidationError
+from typing import Any, Mapping, Optional
+
 from control_plane.application.execution.models import ExecutionFrame
-from .constants import HDR_IDEMPOTENCY_KEY
-from .models import BeginOutcome, CompleteOutcome, RejectOutcome
-from .protocols import IdempotencyKeyDeriver, IdempotencyStore, ResponseHasher
+from core.errors import ValidationError
 
 # Core pure idempotency transitions (immutable state machine)
 from core.guards.idempotency import (
     IdempotencyRecord,
-    IdempotencyStatus,
-    idempotency_start,
     idempotency_complete,
     idempotency_reject,
+    idempotency_start,
     is_replay_of,
 )  # [1](https://teamglobalexp-my.sharepoint.com/personal/djuma_kikombe2_teamglobalexp_com/Documents/Microsoft%20Copilot%20Chat%20Files/phases.txt)
+from core.kernel.invariants import assert_not_none
+
+from .constants import HDR_IDEMPOTENCY_KEY
+from .models import BeginOutcome, CompleteOutcome, RejectOutcome
+from .protocols import IdempotencyKeyDeriver, IdempotencyStore, ResponseHasher
 
 # Optional routing hints (Phase 4 may set these on normalized headers)
 HDR_METHOD = "x-method"
-HDR_ROUTE  = "x-route"
+HDR_ROUTE = "x-route"
+
 
 @dataclass(frozen=True, slots=True)
 class DefaultKeyDeriver:
@@ -30,6 +32,7 @@ class DefaultKeyDeriver:
     Otherwise we deterministically derive: {method}:{route}
     Optional 'scope' k=v pairs (sorted by key) can further disambiguate.
     """
+
     prefix: str = "idem"
 
     def derive(
@@ -44,7 +47,7 @@ class DefaultKeyDeriver:
         base = (header_value or "").strip().lower()
         if not base:
             m = (method or "").strip().lower() or "-"
-            r = (route  or "").strip().lower() or "-"
+            r = (route or "").strip().lower() or "-"
             base = f"{m}:{r}"
         parts = [self.prefix, tenant_id, base]
         if scope:
@@ -52,6 +55,7 @@ class DefaultKeyDeriver:
                 v = str(scope[k]).strip().lower()
                 parts.append(f"{k.strip().lower()}={v}")
         return ":".join(parts)
+
 
 @dataclass(frozen=True, slots=True)
 class IdempotencyService:
@@ -66,6 +70,7 @@ class IdempotencyService:
       - Response payloads are NOT stored here; only 'response_hash' is persisted.
         Infra can map 'response_hash' to cached payload later if desired.
     """
+
     store: IdempotencyStore
     deriver: IdempotencyKeyDeriver
 
@@ -90,10 +95,14 @@ class IdempotencyService:
         existing = self.store.get(key)
 
         # Pure core transition — returns (record, created_new_flag)
-        rec, created_new = idempotency_start(existing, key=key, now_ms=frame.ctx.now())  # [1](https://teamglobalexp-my.sharepoint.com/personal/djuma_kikombe2_teamglobalexp_com/Documents/Microsoft%20Copilot%20Chat%20Files/phases.txt)
+        rec, created_new = idempotency_start(
+            existing, key=key, now_ms=frame.ctx.now()
+        )  # [1](https://teamglobalexp-my.sharepoint.com/personal/djuma_kikombe2_teamglobalexp_com/Documents/Microsoft%20Copilot%20Chat%20Files/phases.txt)
 
         # "Replay" means we already have a COMPLETED record (response can be fetched via response_hash)
-        replay = is_replay_of(existing, response_hash=None)  # True if existing is COMPLETED  # [1](https://teamglobalexp-my.sharepoint.com/personal/djuma_kikombe2_teamglobalexp_com/Documents/Microsoft%20Copilot%20Chat%20Files/phases.txt)
+        replay = is_replay_of(
+            existing, response_hash=None
+        )  # True if existing is COMPLETED  # [1](https://teamglobalexp-my.sharepoint.com/personal/djuma_kikombe2_teamglobalexp_com/Documents/Microsoft%20Copilot%20Chat%20Files/phases.txt)
 
         if persist:
             # Persist the new/updated snapshot (protocol; infra binds real store)
@@ -122,7 +131,9 @@ class IdempotencyService:
         digest = hasher.hash_bytes(payload)
 
         # Pure core transition to COMPLETED
-        rec = idempotency_complete(existing, response_hash=digest, now_ms=frame.ctx.now())  # [1](https://teamglobalexp-my.sharepoint.com/personal/djuma_kikombe2_teamglobalexp_com/Documents/Microsoft%20Copilot%20Chat%20Files/phases.txt)
+        rec = idempotency_complete(
+            existing, response_hash=digest, now_ms=frame.ctx.now()
+        )  # [1](https://teamglobalexp-my.sharepoint.com/personal/djuma_kikombe2_teamglobalexp_com/Documents/Microsoft%20Copilot%20Chat%20Files/phases.txt)
 
         if persist:
             self.store.put(rec)
@@ -148,7 +159,9 @@ class IdempotencyService:
         existing = self._require_existing(k)
         digest = hasher.hash_json(payload)
 
-        rec = idempotency_complete(existing, response_hash=digest, now_ms=frame.ctx.now())  # [1](https://teamglobalexp-my.sharepoint.com/personal/djuma_kikombe2_teamglobalexp_com/Documents/Microsoft%20Copilot%20Chat%20Files/phases.txt)
+        rec = idempotency_complete(
+            existing, response_hash=digest, now_ms=frame.ctx.now()
+        )  # [1](https://teamglobalexp-my.sharepoint.com/personal/djuma_kikombe2_teamglobalexp_com/Documents/Microsoft%20Copilot%20Chat%20Files/phases.txt)
 
         if persist:
             self.store.put(rec)
@@ -173,7 +186,9 @@ class IdempotencyService:
         existing = self.store.get(k)
 
         # Pure core transition to REJECTED (works with or without existing)
-        rec = idempotency_reject(existing, key=k, reason=reason.strip(), now_ms=frame.ctx.now())  # [1](https://teamglobalexp-my.sharepoint.com/personal/djuma_kikombe2_teamglobalexp_com/Documents/Microsoft%20Copilot%20Chat%20Files/phases.txt)
+        rec = idempotency_reject(
+            existing, key=k, reason=reason.strip(), now_ms=frame.ctx.now()
+        )  # [1](https://teamglobalexp-my.sharepoint.com/personal/djuma_kikombe2_teamglobalexp_com/Documents/Microsoft%20Copilot%20Chat%20Files/phases.txt)
 
         if persist:
             self.store.put(rec)
@@ -181,10 +196,12 @@ class IdempotencyService:
 
     # --------- Internals ---------
 
-    def _derive_key(self, frame: ExecutionFrame, headers: Mapping[str, str], scope: Mapping[str, str] | None) -> str:
+    def _derive_key(
+        self, frame: ExecutionFrame, headers: Mapping[str, str], scope: Mapping[str, str] | None
+    ) -> str:
         hv = (headers.get(HDR_IDEMPOTENCY_KEY) or "").strip() or None
         method = (headers.get(HDR_METHOD) or "").strip() or None
-        route  = (headers.get(HDR_ROUTE)  or "").strip() or None
+        route = (headers.get(HDR_ROUTE) or "").strip() or None
         return self.deriver.derive(
             header_value=hv,
             tenant_id=str(frame.tenant_id),
@@ -196,5 +213,7 @@ class IdempotencyService:
     def _require_existing(self, key: str) -> IdempotencyRecord:
         existing = self.store.get(key)
         if existing is None:
-            raise ValidationError(f"Idempotency record not found for key={key!r}; call begin() first")
+            raise ValidationError(
+                f"Idempotency record not found for key={key!r}; call begin() first"
+            )
         return existing

@@ -19,12 +19,12 @@ Rules:
 
 from typing import Dict, Optional, Protocol, runtime_checkable
 
-from core.typing import TenantId
+from core.errors import GrammarViolationError, InvariantViolationError
+from core.kernel.invariants import assert_not_none
+from core.tenancy.grammar import validate_tenant_slug
 from core.tenancy.tenant import Tenant
 from core.tenancy.tenant_context import TenantContext
-from core.tenancy.grammar import validate_tenant_slug
-from core.kernel.invariants import assert_not_none
-from core.errors import InvariantViolationError, GrammarViolationError
+from core.typing import TenantId
 
 
 @runtime_checkable

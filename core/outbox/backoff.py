@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Deterministic Backoff
 ------------------------------------------
@@ -9,7 +8,6 @@ Randomness: FORBIDDEN
 Sleep: FORBIDDEN
 """
 
-
 from dataclasses import dataclass
 
 
@@ -18,6 +16,7 @@ class BackoffPolicy:
     base_ms: int = 100
     factor: int = 2
     max_ms: int = 60_000
+
 
 def compute_backoff_ms(attempt: int, policy: BackoffPolicy = BackoffPolicy()) -> int:
     if attempt <= 0:

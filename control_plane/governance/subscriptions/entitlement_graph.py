@@ -1,9 +1,9 @@
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Dict, Iterable, Tuple
 
-from core.typing import UnixMillis
 from control_plane.governance.plans.plan import Plan
 from control_plane.governance.subscriptions.entitlement import Entitlement, EntitlementSource
+from core.typing import UnixMillis
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,6 +12,7 @@ class EntitlementGraph:
     Immutable set of effective entitlements for a (plan, version).
     Tenant-scoping and persistence are handled by upper layers.
     """
+
     plan_key: str
     plan_version: int
     generated_ms: UnixMillis

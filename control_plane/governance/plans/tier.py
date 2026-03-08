@@ -1,9 +1,8 @@
+import re
 from dataclasses import dataclass
 from enum import Enum, auto
-import re
 
 from core.errors import InvariantViolationError
-
 
 _TIER_CODE_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 
@@ -38,6 +37,7 @@ class TierMeta:
 
     NOTE: No money math here; it's purely metadata for downstream systems.
     """
+
     code: str
     name: str
     billing_cycle: BillingCycle

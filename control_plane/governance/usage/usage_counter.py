@@ -1,11 +1,12 @@
 from dataclasses import dataclass, replace
-from core.typing import UnixMillis, TenantId
-from core.errors import InvariantViolationError
 
-from .windowing import UsageGranularity, window_start_ms, window_end_ms
-from .usage_event import UsageEvent
 from control_plane.governance.features.feature_flag import normalize_feature_key
 from control_plane.governance.usage.usage_event import normalize_metric_key
+from core.errors import InvariantViolationError
+from core.typing import TenantId, UnixMillis
+
+from .usage_event import UsageEvent
+from .windowing import UsageGranularity, window_end_ms, window_start_ms
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,7 @@ class UsageCounter:
       - apply(event) -> new counter (must be same key/window)
       - merge(other) -> new counter (same key/window)
     """
+
     tenant_id: TenantId
     feature_key: str
     metric_key: str
@@ -48,7 +50,11 @@ class UsageCounter:
             raise InvariantViolationError("quantity must be >= 0")
 
         # Sanity: last_event must be inside [start, end)
-        if not (int(self.window_start_ms) <= int(self.last_event_ms) < int(window_end_ms(self.window_start_ms, self.granularity))):
+        if not (
+            int(self.window_start_ms)
+            <= int(self.last_event_ms)
+            < int(window_end_ms(self.window_start_ms, self.granularity))
+        ):
             raise InvariantViolationError("last_event_ms must fall within the counter window")
 
     # ---------- Constructors ----------
@@ -80,12 +86,20 @@ class UsageCounter:
         Fold an event into this counter. Event must match keys and window.
         """
         if not self._same_key(event):
-            raise InvariantViolationError("UsageCounter.apply: mismatched keys (tenant/feature/metric)")
+            raise InvariantViolationError(
+                "UsageCounter.apply: mismatched keys (tenant/feature/metric)"
+            )
         start = window_start_ms(event.timestamp_ms, self.granularity)
         if start != self.window_start_ms:
-            raise InvariantViolationError("UsageCounter.apply: event is outside this counter's window")
+            raise InvariantViolationError(
+                "UsageCounter.apply: event is outside this counter's window"
+            )
         new_qty = int(self.quantity) + int(event.quantity)
-        new_last = event.timestamp_ms if int(event.timestamp_ms) > int(self.last_event_ms) else self.last_event_ms
+        new_last = (
+            event.timestamp_ms
+            if int(event.timestamp_ms) > int(self.last_event_ms)
+            else self.last_event_ms
+        )
         return replace(self, quantity=new_qty, last_event_ms=new_last)
 
     def merge(self, other: "UsageCounter") -> "UsageCounter":
@@ -101,5 +115,9 @@ class UsageCounter:
         ):
             raise InvariantViolationError("UsageCounter.merge: keys/window mismatch")
         new_qty = int(self.quantity) + int(other.quantity)
-        new_last = self.last_event_ms if int(self.last_event_ms) >= int(other.last_event_ms) else other.last_event_ms
+        new_last = (
+            self.last_event_ms
+            if int(self.last_event_ms) >= int(other.last_event_ms)
+            else other.last_event_ms
+        )
         return replace(self, quantity=new_qty, last_event_ms=new_last)

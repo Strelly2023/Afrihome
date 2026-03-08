@@ -14,7 +14,8 @@ from typing import Final
 from core.errors import GrammarViolationError
 
 # segments like "foo.bar.baz"; each segment: [a-z][a-z0-9]*
-TOPIC_PATTERN: Final[re.Pattern[str]] = re.compile(r'^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)*$')
+TOPIC_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)*$")
+
 
 def normalize_topic(topic: str) -> str:
     if topic is None:
@@ -22,9 +23,11 @@ def normalize_topic(topic: str) -> str:
     t = topic.strip().lower()
     return t
 
+
 def is_valid_topic(topic: str) -> bool:
     t = normalize_topic(topic)
     return bool(TOPIC_PATTERN.match(t))
+
 
 def validate_topic(topic: str) -> str:
     t = normalize_topic(topic)

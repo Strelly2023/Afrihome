@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Rate Limiting (Pure Token Bucket)
 ------------------------------------------------------
@@ -14,11 +13,10 @@ Rules:
 - Deterministic refill based on injected timestamps
 """
 
-
 from dataclasses import dataclass
 
-from core.typing import UnixMillis
 from core.errors import InvariantViolationError
+from core.typing import UnixMillis
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +31,9 @@ class TokenBucketState:
     last_refill_ms: UnixMillis
 
 
-def _refill(state: TokenBucketState, now_ms: UnixMillis, policy: TokenBucketPolicy) -> TokenBucketState:
+def _refill(
+    state: TokenBucketState, now_ms: UnixMillis, policy: TokenBucketPolicy
+) -> TokenBucketState:
     if now_ms < state.last_refill_ms:
         raise InvariantViolationError("now_ms must be >= last_refill_ms")
     elapsed = int(now_ms) - int(state.last_refill_ms)
@@ -43,7 +43,9 @@ def _refill(state: TokenBucketState, now_ms: UnixMillis, policy: TokenBucketPoli
     return TokenBucketState(tokens=new_tokens, last_refill_ms=now_ms)
 
 
-def try_consume(state: TokenBucketState, now_ms: UnixMillis, policy: TokenBucketPolicy, cost: int = 1) -> tuple[TokenBucketState, bool]:
+def try_consume(
+    state: TokenBucketState, now_ms: UnixMillis, policy: TokenBucketPolicy, cost: int = 1
+) -> tuple[TokenBucketState, bool]:
     if cost <= 0:
         raise InvariantViolationError("cost must be positive")
     s = _refill(state, now_ms, policy)

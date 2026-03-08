@@ -1,10 +1,13 @@
 from dataclasses import dataclass
-from typing import Mapping, Any
-from core.kernel.invariants import assert_not_none
-from core.events import DomainEvent, EventHeaders, EventEnvelope
+from typing import Mapping
+
 from control_plane.application.execution.models import ExecutionFrame
+from core.events import DomainEvent, EventEnvelope, EventHeaders
+from core.kernel.invariants import assert_not_none
+
 from .models import UsageIncrement, WindowedUsagePlan
 from .protocols import WindowCalculator
+
 
 @dataclass(frozen=True, slots=True)
 class UsageRecorder:
@@ -12,6 +15,7 @@ class UsageRecorder:
     Orchestration-only recorder that turns a usage increment into a pure EventEnvelope.
     No IO; workers later persist/aggregate via outbox/infra.
     """
+
     event_type: str = "usage.recorded"
 
     def record(
@@ -27,6 +31,7 @@ class UsageRecorder:
         assert_not_none(window_calc, "window_calc")
         if not increment.key or not increment.key.strip():
             from core.errors import ValidationError
+
             raise ValidationError("usage key must be a non-empty string")
 
         now_ms = int(frame.ctx.now())
@@ -38,7 +43,9 @@ class UsageRecorder:
             window_id=window_id,
             window_start_ms=ws,
             window_end_ms=we,
-            attributes=dict(increment.attributes) if isinstance(increment.attributes, Mapping) else {},
+            attributes=(
+                dict(increment.attributes) if isinstance(increment.attributes, Mapping) else {}
+            ),
         )
 
         event = DomainEvent(

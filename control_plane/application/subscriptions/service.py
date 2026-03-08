@@ -1,15 +1,22 @@
 from dataclasses import dataclass
-from core.kernel.invariants import assert_not_none
-from core.errors import AuthorizationError, ValidationError
-from core.events import DomainEvent, EventHeaders, EventEnvelope
-from core.typing import UnixMillis
+
 from control_plane.application.execution.models import ExecutionFrame
+from core.errors import AuthorizationError, ValidationError
+from core.events import DomainEvent, EventEnvelope, EventHeaders
+from core.kernel.invariants import assert_not_none
+from core.typing import UnixMillis
+
 from .models import (
-    SubscriptionStatus, PlanRef, SubscriptionSnapshot,
-    ChangeKind, ChangePlanDecision,
-    Boundary, BoundaryDecision,
+    Boundary,
+    BoundaryDecision,
+    ChangeKind,
+    ChangePlanDecision,
+    PlanRef,
+    SubscriptionSnapshot,
+    SubscriptionStatus,
 )
-from .protocols import SubscriptionReader, PlanCatalog, TransitionPolicy
+from .protocols import PlanCatalog, SubscriptionReader, TransitionPolicy
+
 
 @dataclass(frozen=True, slots=True)
 class SubscriptionService:
@@ -20,6 +27,7 @@ class SubscriptionService:
     - Applies TransitionPolicy (pure) to decide effectivity/proration hints.
     - Emits pure DomainEvent/EventEnvelope for outbox (later phases).
     """
+
     reader: SubscriptionReader
     catalog: PlanCatalog
     policy: TransitionPolicy
@@ -63,7 +71,9 @@ class SubscriptionService:
             proration_recommended=bool(proration),
         )
 
-    def build_change_event(self, frame: ExecutionFrame, decision: ChangePlanDecision) -> EventEnvelope:
+    def build_change_event(
+        self, frame: ExecutionFrame, decision: ChangePlanDecision
+    ) -> EventEnvelope:
         """
         Produce a pure EventEnvelope describing the requested plan change.
         No IO; outbox persistence/dispatch happens in later phases.
@@ -105,9 +115,14 @@ class SubscriptionService:
         snap: SubscriptionSnapshot = self.reader.snapshot_for(frame.tenant_id)
 
         if boundary is Boundary.REQUIRES_ACTIVE:
-            if snap.status is SubscriptionStatus.ACTIVE or snap.status is SubscriptionStatus.TRIALING:
+            if (
+                snap.status is SubscriptionStatus.ACTIVE
+                or snap.status is SubscriptionStatus.TRIALING
+            ):
                 return BoundaryDecision(True, boundary, "allow: subscription is active or trialing")
-            return BoundaryDecision(False, boundary, f"deny: subscription status={snap.status.name}")
+            return BoundaryDecision(
+                False, boundary, f"deny: subscription status={snap.status.name}"
+            )
 
         if boundary is Boundary.BILLING_WRITE_ALLOWED:
             # Conservative: disallow writes on CANCELED; allow on ACTIVE/TRIALING; allow on PAST_DUE but mark reason

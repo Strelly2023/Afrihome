@@ -1,13 +1,18 @@
-from typing import Protocol, Optional
+from typing import Iterable, Optional, Protocol
+
+from control_plane.governance.subscriptions.subscription import (
+    Subscription,  # adjust path if needed
+)
 from core.typing import TenantId
-from typing import Protocol, Optional, runtime_checkable, Iterable
-from control_plane.governance.subscriptions.subscription import Subscription  # adjust path if needed
+
 
 class SubscriptionRepository(Protocol):
     """
     Tenant subscription snapshot access.
     """
+
     def snapshot_for(self, tenant_id: TenantId) -> Optional[Subscription]: ...
+
     """
     Subscription repository.
 
@@ -18,5 +23,7 @@ class SubscriptionRepository(Protocol):
     """
 
     def get_active_for_tenant(self, tenant_id: TenantId) -> Optional[Subscription]: ...
-    def list_for_tenant(self, tenant_id: TenantId, *, limit: int = 20, offset: int = 0) -> Iterable[Subscription]: ...
+    def list_for_tenant(
+        self, tenant_id: TenantId, *, limit: int = 20, offset: int = 0
+    ) -> Iterable[Subscription]: ...
     def save(self, sub: Subscription) -> None: ...

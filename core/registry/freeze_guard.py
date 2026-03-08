@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Registry Freeze Guard
 ------------------------------------------
@@ -12,8 +11,8 @@ Rules:
 - Freeze is global and irreversible (delegated to kernel.freeze)
 """
 
-
 from core.kernel.freeze import assert_kernel_mutable
+
 
 def assert_registry_mutable() -> None:
     assert_kernel_mutable()

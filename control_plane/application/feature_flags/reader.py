@@ -1,9 +1,12 @@
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
-from core.kernel.invariants import assert_not_none
+
 from control_plane.application.execution.models import ExecutionFrame
-from .resolver import RuleResolver
+from core.kernel.invariants import assert_not_none
+
 from .models import FeatureDecision
+from .resolver import RuleResolver
+
 
 @dataclass(frozen=True, slots=True)
 class FlagReader:
@@ -11,6 +14,7 @@ class FlagReader:
     Thin convenience wrapper over RuleResolver for common read patterns.
     Orchestration-only; no storage or provider access.
     """
+
     resolver: RuleResolver
 
     def decision(

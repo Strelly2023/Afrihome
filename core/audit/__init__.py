@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Audit Spine (Deterministic)
 -----------------------------------------------
@@ -15,14 +14,16 @@ Purpose:
 """
 
 from .audit_record import AuditRecord
-from .chain import ChainLink, ZERO_HASH, make_chain_link
+from .audit_writer import write_audit_entry
+from .chain import ZERO_HASH, ChainLink, make_chain_link
 from .merkle import merkle_root
 from .storage_protocol import AuditStore
-from .audit_writer import write_audit_entry
 
 __all__ = [
     "AuditRecord",
-    "ChainLink", "ZERO_HASH", "make_chain_link",
+    "ChainLink",
+    "ZERO_HASH",
+    "make_chain_link",
     "merkle_root",
     "AuditStore",
     "write_audit_entry",

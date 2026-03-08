@@ -1,7 +1,8 @@
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Mapping, Any
+from typing import Any, Mapping
+
 
 @dataclass(frozen=True, slots=True)
 class CanonicalJsonResponseHasher:
@@ -10,6 +11,7 @@ class CanonicalJsonResponseHasher:
       - bytes: hashed directly
       - json: canonical JSON (sort_keys=True, compact separators)
     """
+
     def hash_bytes(self, payload: bytes) -> str:
         return hashlib.sha256(payload).hexdigest()
 

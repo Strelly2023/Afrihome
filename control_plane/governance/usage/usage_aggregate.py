@@ -1,9 +1,10 @@
 from dataclasses import dataclass
 from typing import Iterable, Tuple
 
-from core.typing import UnixMillis, TenantId
-from .windowing import UsageGranularity
+from core.typing import TenantId, UnixMillis
+
 from .usage_counter import UsageCounter
+from .windowing import UsageGranularity
 
 
 @dataclass(frozen=True, slots=True)
@@ -11,6 +12,7 @@ class UsageAggregate:
     """
     Immutable roll-up of usage over a time range for a given key.
     """
+
     tenant_id: TenantId
     feature_key: str
     metric_key: str
@@ -36,7 +38,8 @@ def aggregate_counters(
     Assumes `counters` share the same keys/granularity and their windows lie within the range.
     """
     selected = tuple(
-        c for c in counters
+        c
+        for c in counters
         if c.tenant_id == tenant_id
         and c.feature_key == feature_key
         and c.metric_key == metric_key

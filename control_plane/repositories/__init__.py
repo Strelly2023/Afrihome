@@ -5,25 +5,36 @@ Layer order: governance → repositories → application → api → infrastruct
 This package exposes PURE Protocols only. No implementations, no IO.
 """
 
-from .tenant_repository import TenantRepository
-from .identity_repository import IdentityRepository
-from .role_repository import RoleRepository
-from .plan_repository import PlanRepository
-from .subscription_repository import SubscriptionRepository
-from .feature_repository import FeatureRepository
-from .usage_repository import UsageRepository
-from .usage_counter_repository import UsageCounterRepository
-from .usage_aggregate_repository import UsageAggregateRepository
-from .notification_repository import NotificationRepository
-from .provider_repository import ProviderRepository
-from .provider_config_repository import ProviderConfigRepository
+# from .rbac_state_repository import RbacStateRepository, RBACStateRepository
 from .apikey_repository import ApiKeyRepository
-from .rbac_state_repository import RBACStateRepository
-from .audit_repository import AuditWriter, AuditReader
+
+# from .audit_repository import AuditWriter, AuditReader
 from .event_repository import EventTypeRegistry
+from .feature_repository import FeatureRepository
+from .identity_repository import IdentityRepository
+from .notification_repository import NotificationRepository
+from .plan_repository import PlanRepository
+from .provider_config_repository import ProviderConfigRepository
+from .provider_repository import ProviderRepository
+from .rbac_state_repository import RBACStateRepository, RbacStateRepository  # Back-compat alias
+from .role_repository import RoleRepository
+from .subscription_repository import SubscriptionRepository
+from .tenant_repository import TenantRepository
+from .usage_aggregate_repository import UsageAggregateRepository
+from .usage_counter_repository import UsageCounterRepository
+from .usage_repository import UsageRepository
 from .webhook_verification_repository import WebhookVerificationRepository
 
+# Unified audit repository (append/read) — present today
+try:
+    from .audit_repository import AuditRepository  # noqa: F401
+except Exception:
+    # Keep imports soft to avoid masking unrelated test import issues
+    pass
+
+
 __all__ = [
+    "AuditRepository",
     "TenantRepository",
     "IdentityRepository",
     "RoleRepository",
@@ -37,8 +48,10 @@ __all__ = [
     "ProviderRepository",
     "ProviderConfigRepository",
     "ApiKeyRepository",
+    "RBACStateRepository",
     "RbacStateRepository",
-    "AuditWriter", "AuditReader",
+    "AuditWriter",
+    "AuditReader",
     "EventTypeRegistry",
     "WebhookVerificationRepository",
 ]

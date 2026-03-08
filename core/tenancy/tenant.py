@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Tenant Model (Immutable)
 ---------------------------------------------
@@ -15,13 +14,12 @@ Rules:
 - Deterministic slug normalization
 """
 
-
 from dataclasses import dataclass
 from typing import Optional
 
-from core.typing import TenantId
-from core.tenancy.grammar import validate_tenant_slug
 from core.kernel.invariants import assert_not_none
+from core.tenancy.grammar import validate_tenant_slug
+from core.typing import TenantId
 
 
 @dataclass(frozen=True, slots=True)

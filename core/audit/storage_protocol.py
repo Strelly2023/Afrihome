@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Audit Store Protocol
 -----------------------------------------
@@ -7,7 +6,6 @@ LAYER: L2
 Dependencies: core.audit.chain
 IO: NONE (protocol only)
 """
-
 
 from typing import List, Optional, Protocol, runtime_checkable
 

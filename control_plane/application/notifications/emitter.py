@@ -1,10 +1,18 @@
 from dataclasses import dataclass
-from typing import Mapping, Any, Tuple
-from core.kernel.invariants import assert_not_none
-from core.events import DomainEvent, EventHeaders, EventEnvelope
+from typing import Any, Mapping, Tuple
+
 from control_plane.application.execution.models import ExecutionFrame
-from .models import TemplateRef, NotificationPlan, RenderedMessage, ChannelTarget
-from .protocols import TemplateRepository, TemplateBinder, ChannelRouter
+from control_plane.governance.notifications.models import (
+    ChannelTarget,
+    NotificationPlan,
+    RenderedMessage,
+    TemplateRef,
+)
+from core.events import DomainEvent, EventEnvelope, EventHeaders
+from core.kernel.invariants import assert_not_none
+
+from .protocols import ChannelRouter, TemplateBinder, TemplateRepository
+
 
 @dataclass(frozen=True, slots=True)
 class NotificationEmitter:
@@ -16,6 +24,7 @@ class NotificationEmitter:
       4) Emit one EventEnvelope per target ('notification.outbound.requested')
     NOTE: No IO/SDK calls; infra adapters will deliver messages later.
     """
+
     event_type: str = "notification.outbound.requested"
 
     def plan(

@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 
 from core.identity.uuid import UUIDProvider
-from core.typing import UserId as CoreUserId, AggregateId
+from core.typing import AggregateId
+from core.typing import UserId as CoreUserId
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +14,7 @@ class UserId:
     - Compatible with core.typing.UserId
     - Deterministic factory (uses injected UUIDProvider)
     """
+
     value: str
 
     def __post_init__(self) -> None:

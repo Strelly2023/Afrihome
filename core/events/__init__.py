@@ -1,4 +1,4 @@
-
+# core/events/__init__.py
 """
 GA Enterprise Core — Event Spine
 
@@ -11,11 +11,17 @@ Purpose:
 - In-process dispatcher (no IO)
 """
 
+from core.typing import EventId  # <-- re-export EventId for tests
+
+from .bus import InProcessEventBus
+from .envelope import EventEnvelope
 from .event import DomainEvent
 from .headers import EventHeaders
-from .envelope import EventEnvelope
-from .bus import InProcessEventBus
 
 __all__ = [
-    "DomainEvent", "EventHeaders", "EventEnvelope", "InProcessEventBus",
+    "EventId",
+    "DomainEvent",
+    "EventHeaders",
+    "EventEnvelope",
+    "InProcessEventBus",
 ]

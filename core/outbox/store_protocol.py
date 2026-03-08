@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Outbox Store Protocol
 ------------------------------------------
@@ -8,11 +7,10 @@ Dependencies: core.typing, core.outbox.model
 IO: NONE (protocol only)
 """
 
-
 from typing import List, Optional
 
-from core.typing import UnixMillis, EventId
 from core.outbox.model import OutboxRecord
+from core.typing import EventId, UnixMillis
 
 
 class OutboxStore:

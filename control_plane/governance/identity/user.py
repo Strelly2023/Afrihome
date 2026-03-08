@@ -1,12 +1,12 @@
 from dataclasses import dataclass, replace
 from typing import Tuple
 
-from core.typing import UnixMillis, TenantId, RoleName
 from core.errors import InvariantViolationError
 from core.rbac.grammar import validate_permission_name
+from core.typing import RoleName, TenantId, UnixMillis
 
+from .identity_invariants import normalize_display_name, validate_email
 from .user_id import UserId
-from .identity_invariants import validate_email, normalize_display_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +20,7 @@ class User:
     - Role membership tracked by RoleName
     - Direct grants tracked by canonical permission names (not patterns)
     """
+
     user_id: UserId
     tenant_id: TenantId
     email: str

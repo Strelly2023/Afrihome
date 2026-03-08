@@ -9,14 +9,28 @@ Exports:
 - DefaultTemplateBinder
 - NotificationEmitter
 """
-from .models import Channel, ChannelTarget, TemplateRef, RenderedMessage, NotificationPlan
-from .protocols import TemplateRepository, TemplateBinder, ChannelRouter
+
+from control_plane.governance.notifications.models import (
+    Channel,
+    ChannelTarget,
+    NotificationPlan,
+    RenderedMessage,
+    TemplateRef,
+)
+
 from .binder import DefaultTemplateBinder
 from .emitter import NotificationEmitter
+from .protocols import ChannelRouter, TemplateBinder, TemplateRepository
 
 __all__ = [
-    "Channel", "ChannelTarget", "TemplateRef", "RenderedMessage", "NotificationPlan",
-    "TemplateRepository", "TemplateBinder", "ChannelRouter",
+    "Channel",
+    "ChannelTarget",
+    "TemplateRef",
+    "RenderedMessage",
+    "NotificationPlan",
+    "TemplateRepository",
+    "TemplateBinder",
+    "ChannelRouter",
     "DefaultTemplateBinder",
     "NotificationEmitter",
 ]

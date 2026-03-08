@@ -1,5 +1,7 @@
 from dataclasses import dataclass
+
 from core.kernel.invariants import assert_not_none
+
 
 @dataclass(frozen=True, slots=True)
 class AuditAction:
@@ -7,6 +9,7 @@ class AuditAction:
     Action taxonomy for audit (category + verb).
     Example: category="subscription", action="plan.change.requested"
     """
+
     category: str
     action: str
 

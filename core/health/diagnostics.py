@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Health Diagnostics (Deterministic)
 -------------------------------------------------------
@@ -14,14 +13,12 @@ Rules:
 - Pure summarization; timestamps injected by caller
 """
 
-
 from dataclasses import dataclass
-from typing import Mapping, Dict, Tuple
+from typing import Dict, Tuple
 
-from core.health.registry import HealthStatus, HealthCheckResult, HealthRegistry
-from core.typing import UnixMillis
+from core.health.registry import HealthCheckResult, HealthRegistry, HealthStatus
 from core.kernel.invariants import assert_not_none
-
+from core.typing import UnixMillis
 
 _STATUS_RANK = {
     HealthStatus.OK: 0,

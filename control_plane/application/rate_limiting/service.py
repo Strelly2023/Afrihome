@@ -1,11 +1,18 @@
 from dataclasses import dataclass
-from core.kernel.invariants import assert_not_none
-from core.errors import ValidationError, AuthorizationError
-from core.guards.rate_limit import TokenBucketPolicy, TokenBucketState, try_consume  # pure core logic
-from control_plane.application.execution.models import ExecutionFrame
+
 from control_plane.application.actors.models import ActorKind
-from .protocols import RateKeyDeriver, RatePolicyProvider, RateLimitStore
+from control_plane.application.execution.models import ExecutionFrame
+from core.errors import AuthorizationError, ValidationError
+from core.guards.rate_limit import (  # pure core logic
+    TokenBucketPolicy,
+    TokenBucketState,
+    try_consume,
+)
+from core.kernel.invariants import assert_not_none
+
 from .models import RateDecision
+from .protocols import RateKeyDeriver, RateLimitStore, RatePolicyProvider
+
 
 @dataclass(frozen=True, slots=True)
 class RateLimiter:
@@ -18,6 +25,7 @@ class RateLimiter:
       5) Return immutable RateDecision and the new state (store.put is caller-controlled)
     NOTE: No IO here; infra binds store/provider in later phases.
     """
+
     deriver: RateKeyDeriver
     policies: RatePolicyProvider
     store: RateLimitStore
@@ -47,7 +55,9 @@ class RateLimiter:
             # New bucket begins full at first observation, last_refill=now (pure deterministic init)
             prev = TokenBucketState(tokens=float(policy.capacity), last_refill_ms=int(now))
 
-        new_state, allowed = try_consume(prev, int(now), policy, cost)  # pure, deterministic transitions
+        new_state, allowed = try_consume(
+            prev, int(now), policy, cost
+        )  # pure, deterministic transitions
         reason = "allow: under token bucket" if allowed else "deny: rate limit exceeded"
 
         decision = RateDecision(

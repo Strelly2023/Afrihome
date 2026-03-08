@@ -1,13 +1,31 @@
-#control_plane/repositories.rbac_state_repository.py
-from typing import Protocol, Optional, runtime_checkable
+"""
+GA Repository Protocol — RBAC State
+-----------------------------------
+
+Layer: Repositories (ports only; no IO)
+Deterministic: YES
+IO/ORM: NO
+
+Purpose
+-------
+Tenant-scoped storage boundary for the complete RBAC state snapshot
+(roles registry + user->roles assignments).
+
+Notes
+-----
+• Implementations live in control_plane/infrastructure/* and must not leak infra types upward.
+• Methods must be deterministic for identical inputs.
+• Saving the same state twice must be idempotent.
+"""
+
+from typing import Optional, Protocol, runtime_checkable
 
 from control_plane.governance.rbac.rbac_state import RBACState
-from core.typing import TenantId
-
+from control_plane.governance.tenants.tenant_id import TenantId
 
 
 @runtime_checkable
-class RBACStateRepository(Protocol):
+class RbacStateRepository(Protocol):
     """
     RBACState snapshot repository.
 
@@ -18,4 +36,12 @@ class RBACStateRepository(Protocol):
     """
 
     def get_for_tenant(self, tenant_id: TenantId) -> Optional[RBACState]: ...
-    def save_for_tenant(self, tenant_id: TenantId, state: RBACState) -> None: ...
+
+    def save_for_tenant(self, tenant_id: TenantId, state: RBACState) -> None:
+        ...
+        # Idempotent "upsert": same state written again is a no-op.
+
+    # Back-compat alias
+
+
+RBACStateRepository = RbacStateRepository

@@ -1,9 +1,12 @@
 from dataclasses import dataclass
 from typing import Iterable, Tuple
-from core.kernel.invariants import assert_not_none
-from core.events import DomainEvent, EventHeaders, EventEnvelope
+
 from control_plane.application.execution.models import ExecutionFrame
+from core.events import DomainEvent, EventEnvelope, EventHeaders
+from core.kernel.invariants import assert_not_none
+
 from .protocols import WindowCalculator
+
 
 @dataclass(frozen=True, slots=True)
 class AggregationOrchestrator:
@@ -11,6 +14,7 @@ class AggregationOrchestrator:
     Builds pure aggregation request envelopes for one or more windows.
     Downstream workers (Phases 5–7) will read these and compute counters.
     """
+
     event_type: str = "usage.aggregate.requested"
 
     def plan_for_windows(
@@ -33,6 +37,7 @@ class AggregationOrchestrator:
         k = key.strip()
         if not k:
             from core.errors import ValidationError
+
             raise ValidationError("aggregation key must be a non-empty string")
 
         now_ms = int(frame.ctx.now())

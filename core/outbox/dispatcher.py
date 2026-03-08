@@ -20,17 +20,17 @@ Rules:
 from dataclasses import dataclass
 from typing import List
 
-from core.outbox.store_protocol import OutboxStore
-from core.outbox.model import OutboxRecord, OutboxStatus
-from core.outbox.backoff import BackoffPolicy, compute_backoff_ms
 from core.events.envelope import EventEnvelope
 from core.kernel.invariants import assert_not_none, assert_true
+from core.outbox.backoff import BackoffPolicy, compute_backoff_ms
+from core.outbox.model import OutboxRecord, OutboxStatus
+from core.outbox.store_protocol import OutboxStore
 from core.typing import EventId, UnixMillis
-
 
 # ----------------------
 # Immutable DTOs (L2)
 # ----------------------
+
 
 @dataclass(frozen=True, slots=True)
 class DispatchItem:
@@ -47,6 +47,7 @@ class DispatchPlan:
 # ----------------------
 # Pure Dispatcher Logic
 # ----------------------
+
 
 def plan_dispatch(
     store: OutboxStore,

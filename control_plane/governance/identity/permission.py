@@ -11,6 +11,7 @@ class Permission:
     - Normalized & validated by core.rbac.grammar (single authority)
     - Represents a concrete permission (not a pattern)
     """
+
     name: str  # canonical, e.g., "inventory.item.read"
 
     def __post_init__(self) -> None:

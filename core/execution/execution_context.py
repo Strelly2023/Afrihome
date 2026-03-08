@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Execution Context
 --------------------------------------
@@ -18,13 +17,12 @@ Rules:
 - No implicit time reads
 """
 
-
 from dataclasses import dataclass
 
 from core.context.request_context import RequestContext
 from core.identity.uuid import UUIDProvider
-from core.time.clock import Clock
 from core.kernel.invariants import assert_not_none
+from core.time.clock import Clock
 from core.typing import UnixMillis
 
 
@@ -55,6 +53,7 @@ class ExecutionContext:
 
     def with_write_mode(self) -> "ExecutionContext":
         from core.errors import InvariantViolationError
+
         if self.write_mode:
             raise InvariantViolationError("Already in write mode")
         return ExecutionContext(

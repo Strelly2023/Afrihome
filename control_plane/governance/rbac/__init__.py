@@ -1,17 +1,21 @@
-"""
-AfriHome Control Plane — Governance · RBAC (Phase 1.3)
-
-Pure, deterministic RBAC models:
-- PermissionPattern (validated by core.rbac.grammar)
-- RoleDefinition (name + allow/deny patterns)
-- RBACState (immutable registry of roles and assignments, with pure evaluation)
-
-No I/O, no services, no frameworks.
-Evaluation composes core.rbac.poIicy_engine (deny-wins) deterministically.
-"""
-
-from .permission_pattern import PermissionPattern
-from .role import RoleDefinition
+# control_plane/governance/rbac/__init__.py
+from .permission import (
+    Permission,
+    permission_matches,
+    validate_permission_name,
+    validate_permission_pattern,
+)
 from .rbac_state import RBACState
+from .role import Role, RoleDefinition  # RoleDefinition kept for back-compat
+from .role_binding import RoleBinding
 
-__all__ = ["PermissionPattern", "RoleDefinition", "RBACState"]
+__all__ = [
+    "Permission",
+    "validate_permission_name",
+    "validate_permission_pattern",
+    "permission_matches",
+    "Role",
+    "RoleDefinition",
+    "RoleBinding",
+    "RBACState",
+]

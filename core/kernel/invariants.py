@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Kernel Invariant Enforcement
 -------------------------------------------------
@@ -13,15 +12,14 @@ Purpose:
 - Provide deterministic invariant failures
 """
 
-
 from typing import Any
 
 from core.errors import InvariantViolationError
 
-
 # ============================================================
 # Base Invariant
 # ============================================================
+
 
 def assert_invariant(condition: bool, message: str) -> None:
     """
@@ -37,6 +35,7 @@ def assert_invariant(condition: bool, message: str) -> None:
 # ============================================================
 # Common Assertions
 # ============================================================
+
 
 def assert_not_none(value: Any, name: str) -> None:
     """

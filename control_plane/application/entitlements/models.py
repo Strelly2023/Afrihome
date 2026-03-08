@@ -1,22 +1,26 @@
 from dataclasses import dataclass
-from typing import Optional
+
 from core.errors import AuthorizationError
 from core.typing import UnixMillis
+
 
 @dataclass(frozen=True, slots=True)
 class EntitlementDecision:
     """
     Immutable entitlement check result (pure, no IO).
     """
+
     key: str
     allowed: bool
     reason: str
+
 
 @dataclass(frozen=True, slots=True)
 class QuotaDecision:
     """
     Immutable quota enforcement result (pure, no IO).
     """
+
     quota_key: str
     allowed: bool
     used: int
@@ -27,9 +31,11 @@ class QuotaDecision:
     window_end_ms: UnixMillis
     reason: str
 
+
 class QuotaExceededError(AuthorizationError):
     """
     Raised when callers want an exception-based guard (optional).
     """
+
     def __init__(self, reason: str = "Quota exceeded"):
         super().__init__(reason)

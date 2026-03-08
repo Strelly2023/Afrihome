@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Registry Base Types
 ----------------------------------------
@@ -12,9 +11,7 @@ Notes:
 - Keep minimal, deterministic building blocks shared by submodules.
 """
 
-
 from dataclasses import dataclass
-from typing import Callable, Any
 
 
 @dataclass(frozen=True, slots=True)

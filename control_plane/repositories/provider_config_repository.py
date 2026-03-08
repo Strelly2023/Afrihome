@@ -1,9 +1,7 @@
-#control_plane/repositories.provider_config_repository.py
-from typing import Protocol, Optional, runtime_checkable, Iterable
+# control_plane/repositories.provider_config_repository.py
+from typing import Iterable, Optional, Protocol, runtime_checkable
 
 from control_plane.governance.integrations.provider_config import ProviderConfig
-
-
 
 
 @runtime_checkable

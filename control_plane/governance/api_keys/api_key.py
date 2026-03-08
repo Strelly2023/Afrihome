@@ -1,11 +1,14 @@
 from dataclasses import dataclass
 from typing import Optional
-from core.typing import TenantId, UnixMillis
-from core.kernel.invariants import assert_not_none
+
 from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
+from core.typing import TenantId, UnixMillis
+
 from .api_key_id import ApiKeyId
 from .api_key_scope import ApiKeyScope
 from .api_key_status import ApiKeyStatus
+
 
 @dataclass(frozen=True, slots=True)
 class ApiKey:
@@ -13,6 +16,7 @@ class ApiKey:
     Pure, immutable API key aggregate (no secrets here).
     Holds only non-sensitive identity and scope.
     """
+
     tenant_id: TenantId
     key_id: ApiKeyId
     name: str

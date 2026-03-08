@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Global Freeze Authority
 --------------------------------------------
@@ -17,11 +16,9 @@ Rules:
 - Freeze must be explicit.
 """
 
-
 from typing import Final
 
 from core.errors import KernelFrozenError
-
 
 # ============================================================
 # Internal Freeze State
@@ -35,6 +32,7 @@ FREEZE_SENTINEL: Final[str] = "GA_KERNEL_FROZEN_V1"
 # ============================================================
 # Public API
 # ============================================================
+
 
 def freeze_kernel() -> str:
     """
@@ -74,3 +72,9 @@ def assert_kernel_mutable() -> None:
     """
     if _KERNEL_FROZEN:
         raise KernelFrozenError()
+
+
+# TEST-ONLY: do not use in production
+def _reset_for_tests() -> None:
+    global _KERNEL_FROZEN
+    _KERNEL_FROZEN = False

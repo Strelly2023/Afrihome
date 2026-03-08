@@ -15,9 +15,7 @@ from core.errors import GrammarViolationError
 
 # Allow ".", "-", "_" as separators; segments are [a-z0-9]+ and start with a letter.
 # Examples: "reader", "billing.admin", "inventory-reader", "demo_reader"
-ROLE_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
-)
+ROLE_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 
 SEG = r"[a-z][a-z0-9]*"
 PERMISSION_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(rf"^{SEG}(?:\.{SEG})*$")

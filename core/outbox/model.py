@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Outbox Model
 ---------------------------------
@@ -9,14 +8,13 @@ Deterministic: YES
 IO: NONE
 """
 
-
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
 
-from core.typing import UnixMillis, EventId
-from core.events.envelope import EventEnvelope
 from core.errors import InvariantViolationError
+from core.events.envelope import EventEnvelope
+from core.typing import EventId, UnixMillis
 
 
 class OutboxStatus(Enum):
@@ -53,7 +51,9 @@ class OutboxRecord:
             last_error=None,
         )
 
-    def schedule_retry(self, now_ms: UnixMillis, next_delay_ms: int, error: Optional[str]) -> "OutboxRecord":
+    def schedule_retry(
+        self, now_ms: UnixMillis, next_delay_ms: int, error: Optional[str]
+    ) -> "OutboxRecord":
         if now_ms < 0 or next_delay_ms < 0:
             raise InvariantViolationError("now_ms and next_delay_ms must be non-negative")
         return OutboxRecord(

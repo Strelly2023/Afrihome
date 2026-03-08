@@ -1,12 +1,18 @@
 from dataclasses import dataclass
-from core.kernel.invariants import assert_not_none
-from core.errors import ValidationError, AuthorizationError
-from control_plane.application.execution.models import ExecutionFrame
-from .models import (
-    ProviderRef, ProviderConfig, ProviderContext,
-    CredentialPurpose, ResolvedCredential,
+
+from control_plane.application.execution.models import (
+    CredentialPurpose,
+    ExecutionFrame,
+    ProviderConfig,
+    ProviderContext,
+    ProviderRef,
+    ResolvedCredential,
 )
-from .protocols import ProviderConfigRepository, CredentialResolver, ProviderPolicy
+from core.errors import AuthorizationError, ValidationError
+from core.kernel.invariants import assert_not_none
+
+from .protocols import CredentialResolver, ProviderConfigRepository, ProviderPolicy
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderConfigService:
@@ -17,6 +23,7 @@ class ProviderConfigService:
       3) Apply pure ProviderPolicy guards (governance) before use
     NO IO, NO cleartext secrets, NO SDK calls in application layer.
     """
+
     repo: ProviderConfigRepository
     creds: CredentialResolver
     policy: ProviderPolicy | None = None
@@ -24,11 +31,7 @@ class ProviderConfigService:
     # ---------- Queries ----------
 
     def get_config(
-        self,
-        frame: ExecutionFrame,
-        provider_name: str,
-        *,
-        version: str | None = None
+        self, frame: ExecutionFrame, provider_name: str, *, version: str | None = None
     ) -> ProviderConfig:
         assert_not_none(frame, "frame")
         name = (provider_name or "").strip().lower()
@@ -42,21 +45,13 @@ class ProviderConfigService:
         return cfg
 
     def is_enabled(
-        self,
-        frame: ExecutionFrame,
-        provider_name: str,
-        *,
-        version: str | None = None
+        self, frame: ExecutionFrame, provider_name: str, *, version: str | None = None
     ) -> bool:
         cfg = self.get_config(frame, provider_name, version=version)
         return bool(cfg.enabled)
 
     def require_enabled(
-        self,
-        frame: ExecutionFrame,
-        provider_name: str,
-        *,
-        version: str | None = None
+        self, frame: ExecutionFrame, provider_name: str, *, version: str | None = None
     ) -> ProviderConfig:
         cfg = self.get_config(frame, provider_name, version=version)
         if not cfg.enabled:

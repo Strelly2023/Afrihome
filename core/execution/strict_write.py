@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Strict Write Enforcement
 ---------------------------------------------
@@ -12,9 +11,8 @@ Purpose:
 - Prevent write operations outside explicit write mode.
 """
 
-
-from core.execution.execution_context import ExecutionContext
 from core.errors import StrictWriteViolationError
+from core.execution.execution_context import ExecutionContext
 
 
 class StrictWriteMode:

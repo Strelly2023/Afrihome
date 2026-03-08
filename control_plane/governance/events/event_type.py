@@ -1,12 +1,15 @@
 from dataclasses import dataclass
-from core.kernel.invariants import assert_not_none
+
 from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
+
 
 @dataclass(frozen=True, slots=True)
 class EventType:
     """
     Canonical platform event type (e.g., "billing.invoice.created").
     """
+
     name: str
 
     def __post_init__(self) -> None:

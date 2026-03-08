@@ -22,6 +22,7 @@ class Entitlement:
     - source          : PLAN_DEFAULT or OVERRIDE
     - note            : Optional textual reason
     """
+
     feature_key: str
     enabled: bool
     source: EntitlementSource

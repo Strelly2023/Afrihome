@@ -1,16 +1,15 @@
-from dataclasses import dataclass
 import re
-from typing import Tuple, Optional, Iterable, Any
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 from core.errors import InvariantViolationError
-from core.typing import UnixMillis, TenantId, UserId
+from core.typing import TenantId, UnixMillis, UserId
 
-from .flag_rule import FlagRule, RuleEffect, ActorKind
-from .feature_state_snapshot import FeatureStateSnapshot, DecisionSource
+from .feature_state_snapshot import DecisionSource, FeatureStateSnapshot
+from .flag_rule import ActorKind, FlagRule, RuleEffect
 
-
-#_FEATURE_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
-_FEATURE_KEY_RE = re.compile(r'^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$')
+# _FEATURE_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+_FEATURE_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 
 
 def normalize_feature_key(key: str) -> str:
@@ -27,6 +26,7 @@ class Target:
     """
     Evaluation target (pure carrier). No framework types here.
     """
+
     tenant_id: Optional[TenantId]
     tenant_slug: Optional[str]
     user_id: Optional[UserId]
@@ -54,6 +54,7 @@ class FeatureFlag:
         3) rule_id lexicographic tiebreak
     - If no rule matches, return enabled_default.
     """
+
     key: str
     enabled_default: bool
     rules: Tuple[FlagRule, ...] = ()
@@ -113,7 +114,7 @@ class FeatureFlag:
         # Deterministic selection
         matches.sort(key=lambda x: (x[0], x[1], x[2]))
         _, _, _, best = matches[0]
-        enabled = (best.effect is RuleEffect.ENABLE)
+        enabled = best.effect is RuleEffect.ENABLE
 
         return FeatureStateSnapshot(
             feature_key=self.key,

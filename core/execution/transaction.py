@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Logical Transaction Boundary
 -------------------------------------------------
@@ -13,7 +12,6 @@ Rules:
 - No commit/rollback
 - Pure scope wrapper
 """
-
 
 from dataclasses import dataclass
 

@@ -1,6 +1,6 @@
-from dataclasses import dataclass, replace
-from typing import Tuple, Dict
 import re
+from dataclasses import dataclass, replace
+from typing import Dict, Tuple
 
 from core.errors import InvariantViolationError
 from core.typing import UnixMillis
@@ -8,9 +8,9 @@ from core.typing import UnixMillis
 from .plan_feature import PlanFeature
 from .tier import TierMeta
 
+# _PLAN_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+_PLAN_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 
-#_PLAN_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
-_PLAN_KEY_RE = re.compile(r'^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$')
 
 def normalize_plan_key(key: str) -> str:
     if not isinstance(key, str):
@@ -40,6 +40,7 @@ class Plan:
     Transitions are pure (return new instances).
     No persistence, no billing math, no adapters here.
     """
+
     key: str
     name: str
     version: int

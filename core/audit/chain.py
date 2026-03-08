@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Audit Chain
 --------------------------------
@@ -14,13 +13,12 @@ Rules:
 - No IO
 """
 
-
 import hashlib
 from dataclasses import dataclass
 from typing import Optional
 
-from core.kernel.invariants import assert_not_none
 from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
 
 ZERO_HASH: str = "0" * 64
 
@@ -59,4 +57,6 @@ def make_chain_link(prev: Optional["ChainLink"], record_hash: str) -> "ChainLink
         prev_hash = prev.chain_hash
         index = prev.index + 1
     chain_hash = hashlib.sha256(_hex_to_bytes(prev_hash) + _hex_to_bytes(record_hash)).hexdigest()
-    return ChainLink(index=index, prev_hash=prev_hash, record_hash=record_hash, chain_hash=chain_hash)
+    return ChainLink(
+        index=index, prev_hash=prev_hash, record_hash=record_hash, chain_hash=chain_hash
+    )

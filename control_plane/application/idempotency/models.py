@@ -1,7 +1,9 @@
 from dataclasses import dataclass
-from typing import Optional
+
 from core.guards.idempotency import IdempotencyRecord  # pure, immutable core model  # noqa
+
 # (No IO here; this module orchestrates transitions only.)                          # noqa
+
 
 @dataclass(frozen=True, slots=True)
 class BeginOutcome:
@@ -12,10 +14,12 @@ class BeginOutcome:
     - replay: True iff an earlier COMPLETED record already exists (same key)
     - key: stable idempotency key used
     """
+
     record: IdempotencyRecord
     created_new: bool
     replay: bool
     key: str
+
 
 @dataclass(frozen=True, slots=True)
 class CompleteOutcome:
@@ -24,8 +28,10 @@ class CompleteOutcome:
     - record: COMPLETED record (immutable)
     - key: idempotency key
     """
+
     record: IdempotencyRecord
     key: str
+
 
 @dataclass(frozen=True, slots=True)
 class RejectOutcome:
@@ -34,5 +40,6 @@ class RejectOutcome:
     - record: REJECTED record (immutable)
     - key: idempotency key
     """
+
     record: IdempotencyRecord
     key: str

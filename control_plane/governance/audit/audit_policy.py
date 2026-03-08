@@ -1,11 +1,13 @@
 from dataclasses import dataclass
-from typing import Mapping, Any
+from typing import Any, Mapping
+
 
 @dataclass(frozen=True, slots=True)
 class AuditPolicy:
     """
     Governance redaction rules applied before persistence.
     """
+
     redact_fields: tuple[str, ...] = ()
 
     def apply(self, data: Mapping[str, Any]) -> Mapping[str, Any]:

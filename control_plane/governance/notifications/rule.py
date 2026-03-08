@@ -1,17 +1,15 @@
-from dataclasses import dataclass
-from typing import Tuple, Optional
 import re
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
+from control_plane.governance.features.flag_rule import ActorKind
+from control_plane.governance.notifications.template import Channel, normalize_template_key
 from core.errors import InvariantViolationError
 from core.typing import TenantId, UserId
 
-from control_plane.governance.notifications.template import Channel, normalize_template_key
-from control_plane.governance.features.flag_rule import ActorKind
-
-
 # Event key grammar ("platform.tenant.created", "domain.booking.confirmed")
-#_EVENT_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
-_EVENT_KEY_RE = re.compile(r'^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$')
+# _EVENT_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
+_EVENT_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 
 
 def normalize_event_key(key: str) -> str:
@@ -52,6 +50,7 @@ class NotificationRule:
     - matches(...) → bool   : whether target & event match this rule
     - select_channels(allowed_from_template) → Tuple[Channel,...] intersection
     """
+
     rule_id: str
     priority: int
     enabled: bool

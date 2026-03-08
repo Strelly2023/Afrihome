@@ -2,8 +2,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional
 
-from core.errors import InvariantViolationError
 from control_plane.governance.features.feature_flag import normalize_feature_key
+from core.errors import InvariantViolationError
 
 
 class OveragePolicy(Enum):
@@ -11,9 +11,10 @@ class OveragePolicy(Enum):
     Governance-only signal for how over-usage is *conceptually* treated.
     Application/infra will implement actual behavior later.
     """
-    NONE = auto()           # no overage allowed (hard block)
+
+    NONE = auto()  # no overage allowed (hard block)
     ALLOW_METERED = auto()  # allow and meter for later billing
-    ALLOW_SOFT = auto()     # allow but soft-warn (no billing implied here)
+    ALLOW_SOFT = auto()  # allow but soft-warn (no billing implied here)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +28,7 @@ class PlanFeature:
     - overage_policy      : how over-usage is conceptually treated (governance)
     - description         : optional human text, not used for logic
     """
+
     feature_key: str
     enabled_default: bool
     quota_limit: Optional[int] = None

@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Execution Layer
 

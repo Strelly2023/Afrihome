@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Request Context Layer
 
@@ -9,13 +8,13 @@ Purpose:
 - Safe access helpers
 """
 
-from .request_context import RequestContext
 from .accessors import (
+    require_correlation_id,
+    require_request_id,
     require_tenant_id,
     require_user_id,
-    require_request_id,
-    require_correlation_id,
 )
+from .request_context import RequestContext
 
 __all__ = [
     "RequestContext",

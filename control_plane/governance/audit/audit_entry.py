@@ -1,10 +1,13 @@
-import hashlib, json
+# control_plane/governance/audit/audit_entry.py
+import hashlib
+import json
 from dataclasses import dataclass
-from typing import Mapping, Any
+
 from core.kernel.invariants import assert_not_none
-from core.typing import UnixMillis
+
 from .audit_event import AuditEvent
 from .audit_policy import AuditPolicy
+
 
 def compute_audit_content_hash(event: AuditEvent, policy: AuditPolicy | None = None) -> str:
     payload = {
@@ -17,11 +20,13 @@ def compute_audit_content_hash(event: AuditEvent, policy: AuditPolicy | None = N
     enc = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(enc).hexdigest()
 
+
 @dataclass(frozen=True, slots=True)
 class AuditEntry:
     """
     Immutable audit entry prepared for persistence (still IO-free).
     """
+
     event: AuditEvent
     content_hash: str
 

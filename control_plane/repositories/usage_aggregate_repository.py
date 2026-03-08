@@ -1,10 +1,9 @@
-#control_plane/repositories.usage_aggregate_repository.py
-from typing import Protocol, Optional, runtime_checkable
+# control_plane/repositories.usage_aggregate_repository.py
+from typing import Optional, Protocol, runtime_checkable
 
 from control_plane.governance.usage.usage_aggregate import UsageAggregate
 from control_plane.governance.usage.windowing import UsageGranularity
 from core.typing import TenantId, UnixMillis
-
 
 
 @runtime_checkable

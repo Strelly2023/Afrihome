@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Tenancy Slug Grammar
 -----------------------------------------
@@ -9,7 +8,6 @@ Deterministic: YES
 IO: NONE
 RBAC: FORBIDDEN
 """
-
 
 import re
 from typing import Final

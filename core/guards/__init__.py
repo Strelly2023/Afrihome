@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Guards (Pure Governance Logic)
 
@@ -16,38 +15,54 @@ Rules:
 - Deterministic, replay-safe
 """
 
-from .preconditions import (
-    require,
-    require_present,
-    require_non_empty_str,
-    require_equal,
-    require_allowed,
+from .circuit_breaker import (
+    CircuitPolicy,
+    CircuitSnapshot,
+    CircuitState,
+    can_execute,
+    record_failure,
+    record_success,
 )
 from .idempotency import (
-    IdempotencyStatus,
     IdempotencyRecord,
-    idempotency_start,
+    IdempotencyStatus,
     idempotency_complete,
     idempotency_reject,
+    idempotency_start,
     is_replay_of,
+)
+from .preconditions import (
+    require,
+    require_allowed,
+    require_equal,
+    require_non_empty_str,
+    require_present,
 )
 from .rate_limit import (
     TokenBucketPolicy,
     TokenBucketState,
     try_consume,
 )
-from .circuit_breaker import (
-    CircuitState,
-    CircuitPolicy,
-    CircuitSnapshot,
-    can_execute,
-    record_success,
-    record_failure,
-)
 
 __all__ = [
-    "require", "require_present", "require_non_empty_str", "require_equal", "require_allowed",
-    "IdempotencyStatus", "IdempotencyRecord", "idempotency_start", "idempotency_complete", "idempotency_reject", "is_replay_of",
-    "TokenBucketPolicy", "TokenBucketState", "try_consume",
-    "CircuitState", "CircuitPolicy", "CircuitSnapshot", "can_execute", "record_success", "record_failure",
+    "require",
+    "require_present",
+    "require_non_empty_str",
+    "require_equal",
+    "require_allowed",
+    "IdempotencyStatus",
+    "IdempotencyRecord",
+    "idempotency_start",
+    "idempotency_complete",
+    "idempotency_reject",
+    "is_replay_of",
+    "TokenBucketPolicy",
+    "TokenBucketState",
+    "try_consume",
+    "CircuitState",
+    "CircuitPolicy",
+    "CircuitSnapshot",
+    "can_execute",
+    "record_success",
+    "record_failure",
 ]

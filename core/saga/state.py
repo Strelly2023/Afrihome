@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Saga State (Immutable, Pure)
 -------------------------------------------------
@@ -16,14 +15,13 @@ Rules:
 - No IO/logging/threads
 """
 
-
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Tuple, Optional, Mapping, Any
+from typing import Any, Mapping, Optional, Tuple
 
-from core.typing import AggregateId, Version, UnixMillis, CorrelationId, CausationId
-from core.kernel.invariants import assert_not_none
 from core.errors import InvariantViolationError
+from core.kernel.invariants import assert_not_none
+from core.typing import AggregateId, CausationId, CorrelationId, UnixMillis, Version
 
 
 class StepStatus(Enum):
@@ -128,7 +126,11 @@ class SagaSnapshot:
         if self.status != SagaStatus.RUNNING:
             raise InvariantViolationError("step_done only allowed in RUNNING")
         steps = self._replace_step(name, StepStatus.DONE)
-        new_status = SagaStatus.COMPLETED if all(s.status == StepStatus.DONE for s in steps) else SagaStatus.RUNNING
+        new_status = (
+            SagaStatus.COMPLETED
+            if all(s.status == StepStatus.DONE for s in steps)
+            else SagaStatus.RUNNING
+        )
         return self._with(status=new_status, steps=steps, updated_ms=now_ms)
 
     def step_failed(self, name: str, error: str, now_ms: UnixMillis) -> "SagaSnapshot":
@@ -152,13 +154,22 @@ class SagaSnapshot:
         if self.status != SagaStatus.COMPENSATING:
             raise InvariantViolationError("step_compensated only allowed in COMPENSATING")
         steps = self._replace_step(name, StepStatus.COMPENSATED)
-        new_status = SagaStatus.COMPLETED if all(s.status in (StepStatus.COMPENSATED, StepStatus.PENDING, StepStatus.SKIPPED) for s in steps) else SagaStatus.COMPENSATING
+        new_status = (
+            SagaStatus.COMPLETED
+            if all(
+                s.status in (StepStatus.COMPENSATED, StepStatus.PENDING, StepStatus.SKIPPED)
+                for s in steps
+            )
+            else SagaStatus.COMPENSATING
+        )
         return self._with(status=new_status, steps=steps, updated_ms=now_ms)
 
     def with_context(self, ctx: Mapping[str, Any], now_ms: UnixMillis) -> "SagaSnapshot":
         return self._with(context=ctx, updated_ms=now_ms)
 
-    def with_correlation(self, correlation_id: CorrelationId, causation_id: CausationId, now_ms: UnixMillis) -> "SagaSnapshot":
+    def with_correlation(
+        self, correlation_id: CorrelationId, causation_id: CausationId, now_ms: UnixMillis
+    ) -> "SagaSnapshot":
         return SagaSnapshot(
             saga_id=self.saga_id,
             status=self.status,

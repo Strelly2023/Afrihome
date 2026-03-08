@@ -18,11 +18,10 @@ Rules:
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
 
-from core.registry.scopes import RegistryScope, DEFAULT_SCOPE_CHAIN
-from core.registry.freeze_guard import assert_registry_mutable
-from core.kernel.invariants import assert_not_none
 from core.errors import ValidationError
-
+from core.kernel.invariants import assert_not_none
+from core.registry.freeze_guard import assert_registry_mutable
+from core.registry.scopes import DEFAULT_SCOPE_CHAIN, RegistryScope
 
 EventHandler = Callable[[object], None]
 
@@ -72,9 +71,7 @@ class HandlerRegistry:
 
         # Prevent duplicate registration of the *same callable* for the same (scope, key)
         if any(h.handler is handler for h in bucket):
-            raise ValidationError(
-                f"Handler already registered for key={key!r} scope={scope.name}"
-            )
+            raise ValidationError(f"Handler already registered for key={key!r} scope={scope.name}")
         bucket.append(entry)
 
     def list_for(

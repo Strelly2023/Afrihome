@@ -7,9 +7,14 @@ Pure, deterministic models:
 
 This ties tenants → plans → entitlements in a constitution-safe way.
 """
-from .subscription import Subscription, SubscriptionStatus, PlanChangePolicy
+
 from .entitlement import Entitlement, EntitlementSource
-from .entitlement_graph import EntitlementGraph, build_entitlements_from_plan, apply_entitlement_overrides
+from .entitlement_graph import (
+    EntitlementGraph,
+    apply_entitlement_overrides,
+    build_entitlements_from_plan,
+)
+from .subscription import PlanChangePolicy, Subscription, SubscriptionStatus
 
 __all__ = [
     "Subscription",

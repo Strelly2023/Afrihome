@@ -1,4 +1,3 @@
-
 """
 GA Enterprise Core — Tenancy Layer (L3)
 
@@ -15,19 +14,19 @@ Rules:
 
 from .grammar import (
     TENANT_SLUG_PATTERN,
-    normalize_tenant_slug,
     is_valid_tenant_slug,
+    normalize_tenant_slug,
     validate_tenant_slug,
+)
+from .resolver import (
+    DeterministicMapTenantResolver,
+    TenantResolver,
+    resolve_tenant_context_by_id,
+    resolve_tenant_context_by_slug,
+    resolve_tenant_required,
 )
 from .tenant import Tenant
 from .tenant_context import TenantContext
-from .resolver import (
-    TenantResolver,
-    DeterministicMapTenantResolver,
-    resolve_tenant_required,
-    resolve_tenant_context_by_slug,
-    resolve_tenant_context_by_id,
-)
 
 __all__ = [
     "TENANT_SLUG_PATTERN",

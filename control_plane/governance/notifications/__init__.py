@@ -14,8 +14,8 @@ No services, no infrastructure here. The application layer will:
 Key grammar is aligned with other governance keys (lowercase, dot/underscore/dash separated).
 """
 
-from .template import NotificationTemplate, Channel, normalize_template_key
 from .rule import NotificationRule, normalize_event_key
+from .template import Channel, NotificationTemplate, normalize_template_key
 
 __all__ = [
     "Channel",

@@ -1,116 +1,157 @@
+# control_plane/governance/rbac/rbac_state.py
+from __future__ import annotations
+
 from dataclasses import dataclass, field, replace
-from typing import Dict, Tuple, Optional
+from typing import Dict, Iterable, Mapping, Tuple
 
-from core.typing import RoleName, Permission, UserId
-from core.errors import InvariantViolationError
-from core.rbac.roles import Role as CoreRole
-from core.rbac.policy_engine import Policy, Subject, PolicyEngine
+from control_plane.governance.identity.user_id import UserId
+from core.errors import GrammarViolationError
+
+from .permission import Permission  # for evaluate_for_user back-compat
+from .role import Role, RoleName, _norm_role
+from .role_binding import RoleBinding
 
 
-from .role import RoleDefinition
+def _norm_user_id(uid: str) -> str:
+    if uid is None:
+        raise GrammarViolationError("user_id must not be None")
+    u = uid.strip()
+    if not u:
+        raise GrammarViolationError("user_id must not be empty")
+    return u
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class RBACState:
     """
-    Immutable RBAC registry + assignments.
+    Immutable RBAC snapshot:
 
-    - roles: mapping of role_name -> RoleDefinition (definition registry)
-    - assignments: mapping of user_id -> tuple[RoleName, ...] (who has what roles)
-    - Pure updates (return new RBACState)
-    - Deterministic evaluation via core.rbac.PolicyEngine (deny-wins)
+      - roles:       role_name -> Role (allow/deny patterns)
+      - assignments: user_id   -> tuple(role_name, ...)
 
-    Scope:
-    - This object can be logically tenant-scoped by its owner.
-      We keep it tenant-agnostic here to remain reusable.
+    Deny-wins evaluation:
+      1) If ANY assigned role denies => DENY
+      2) Else if ANY assigned role allows => ALLOW
+      3) Else => default DENY
     """
-    roles: Dict[str, RoleDefinition] = field(default_factory=dict)
-    assignments: Dict[str, Tuple[RoleName, ...]] = field(default_factory=dict)
 
-    # ---------- Role Registry (pure) ----------
+    roles: Mapping[str, Role] = field(default_factory=dict)
+    assignments: Mapping[str, Tuple[str, ...]] = field(
+        default_factory=dict
+    )  # user_id -> role names
 
-    def register_role(self, role: RoleDefinition) -> "RBACState":
-        name = str(role.name)
-        if name in self.roles:
-            raise InvariantViolationError(f"Role {name!r} already exists")
-        new_roles = dict(self.roles)
-        new_roles[name] = role
+    # ---------------- Canonical immutable builders ----------------
+
+    def with_role(self, role: Role) -> "RBACState":
+        rname = role.name
+        new_roles: Dict[str, Role] = dict(self.roles)
+        new_roles[rname] = role
         return replace(self, roles=new_roles)
 
-    def upsert_role(self, role: RoleDefinition) -> "RBACState":
-        name = str(role.name)
-        new_roles = dict(self.roles)
-        new_roles[name] = role
-        return replace(self, roles=new_roles)
-
-    def remove_role(self, role_name: RoleName) -> "RBACState":
-        name = str(role_name)
-        if name not in self.roles:
-            raise InvariantViolationError(f"Role {name!r} not found")
-        # Remove role definition
-        new_roles = dict(self.roles)
-        del new_roles[name]
-        # Remove role from assignments
-        new_assignments: Dict[str, Tuple[RoleName, ...]] = {}
-        for uid, roles in self.assignments.items():
-            new_assignments[uid] = tuple(r for r in roles if str(r) != name)
-        return replace(self, roles=new_roles, assignments=new_assignments)
-
-    # ---------- Assignments (pure) ----------
-
-    def assign_role(self, user_id: UserId, role_name: RoleName) -> "RBACState":
-        rname = str(role_name)
-        if rname not in self.roles:
-            raise InvariantViolationError(f"Role {rname!r} is not registered")
-        uid = str(user_id)
-        current = self.assignments.get(uid, ())
-        if role_name in current:
-            return replace(self, assignments=dict(self.assignments))  # no-op; preserve immutability
-        new_assignments = dict(self.assignments)
-        new_assignments[uid] = current + (role_name,)
-        return replace(self, assignments=new_assignments)
-
-    def revoke_role(self, user_id: UserId, role_name: RoleName) -> "RBACState":
-        uid = str(user_id)
-        current = self.assignments.get(uid)
-        if not current:
-            return replace(self, assignments=dict(self.assignments))
-        new = tuple(r for r in current if r != role_name)
-        new_assignments = dict(self.assignments)
-        new_assignments[uid] = new
-        return replace(self, assignments=new_assignments)
-
-    def subject_roles(self, user_id: UserId) -> Tuple[RoleName, ...]:
-        return self.assignments.get(str(user_id), ())
-
-    # ---------- Evaluation (deny-wins, deterministic) ----------
-
-    def _to_policy(self) -> Policy:
-        """
-        Convert RoleDefinition registry to a core.rbac.policy_engine.Policy.
-        Deterministic mapping: copy allow/deny exactly as defined.
-        """
-        roles_map: Dict[str, CoreRole] = {
-            name: CoreRole(name=RoleName(name), allow=tuple(defn.allow), deny=tuple(defn.deny))
-            for name, defn in self.roles.items()
+    def without_role(self, role_name: str) -> "RBACState":
+        rn = _norm_role(role_name)
+        if rn not in self.roles:
+            return self
+        new_roles: Dict[str, Role] = dict(self.roles)
+        del new_roles[rn]
+        new_asg: Dict[str, Tuple[str, ...]] = {
+            uid: tuple(r for r in roles if r != rn) for uid, roles in self.assignments.items()
         }
-        return Policy(roles=roles_map)
+        return replace(self, roles=new_roles, assignments=new_asg)
 
-    def evaluate_for_user(self, user_id: UserId, permission: Permission) -> bool:
-        """
-        Deny-wins permission check for a given user_id and permission name.
-        Returns True if allowed, False otherwise.
-        """
-        policy = self._to_policy()
-        subject = Subject(user_id=user_id, roles=self.subject_roles(user_id))
-        decision = PolicyEngine().evaluate(policy, subject, permission)
-        return decision.allowed
+    def assign(self, user_id: str, *role_names: str) -> "RBACState":
+        uid = _norm_user_id(user_id)
+        rs = tuple(_norm_role(r) for r in role_names)
+        cur = tuple(self.assignments.get(uid, ()))
+        seen = set(cur)
+        merged = cur + tuple(r for r in rs if r not in seen)
+        return replace(self, assignments={**self.assignments, uid: merged})
 
-    def debug_decision(self, user_id: UserId, permission: Permission) -> str:
+    def unassign(self, user_id: str, role_name: str) -> "RBACState":
+        uid = _norm_user_id(user_id)
+        rn = _norm_role(role_name)
+        cur = tuple(self.assignments.get(uid, ()))
+        if rn not in cur:
+            return self
+        new_tuple = tuple(r for r in cur if r != rn)
+        new_asg = dict(self.assignments)
+        new_asg[uid] = new_tuple
+        return replace(self, assignments=new_asg)
+
+    # ---------------- Back-compat shims ----------------
+
+    def register_role(self, role: Role) -> "RBACState":
+        return self.with_role(role)
+
+    def register_roles(self, *roles: Role) -> "RBACState":
+        s = self
+        for r in roles:
+            s = s.with_role(r)
+        return s
+
+    def register_binding(self, binding: RoleBinding) -> "RBACState":
+        return self.assign(binding.user_id, *binding.roles)
+
+    def assign_user(self, user_id: str | UserId, roles: Iterable[str]) -> "RBACState":
+        uid = str(user_id) if isinstance(user_id, UserId) else _norm_user_id(user_id)
+        canon = tuple(_norm_role(r) for r in roles or ())
+        if not canon:
+            return self
+        return self.assign(uid, *canon)
+
+    def unassign_user(self, user_id: str | UserId, role_name: str) -> "RBACState":
+        uid = str(user_id) if isinstance(user_id, UserId) else _norm_user_id(user_id)
+        return self.unassign(uid, role_name)
+
+    def roles_of(self, user_id: str | UserId) -> Tuple[str, ...]:
+        return self.roles_for_user(user_id)
+
+    def assign_role(self, user_id: str | UserId, role_name: str | RoleName) -> "RBACState":
         """
-        Same as evaluate_for_user, but returns reason string for diagnostics.
+        Back-compat single-role assign:
+          - user_id may be UserId or str
+          - role_name may be RoleName or str
         """
-        policy = self._to_policy()
-        subject = Subject(user_id=user_id, roles=self.subject_roles(user_id))
-        decision = PolicyEngine().evaluate(policy, subject, permission)
-        return decision.reason
+        uid = str(user_id) if isinstance(user_id, UserId) else _norm_user_id(user_id)
+        rn = str(role_name) if isinstance(role_name, RoleName) else role_name
+        return self.assign(uid, rn)
+
+    # ---------------- Queries / evaluation ----------------
+
+    def roles_for_user(self, user_id: str | UserId) -> Tuple[str, ...]:
+        uid = str(user_id) if isinstance(user_id, UserId) else _norm_user_id(user_id)
+        return tuple(self.assignments.get(uid, ()))
+
+    def has_for_user(self, user_id: str | UserId, permission: str) -> bool:
+        uid = str(user_id) if isinstance(user_id, UserId) else _norm_user_id(user_id)
+        names = self.assignments.get(uid, ())
+        if not names:
+            return False
+        roles = [self.roles[rn] for rn in names if rn in self.roles]
+        if any(r.denies(permission) for r in roles):  # deny wins
+            return False
+        if any(r.allows(permission) for r in roles):
+            return True
+        return False
+
+    def evaluate_for_user(self, user_id: str | UserId, permission: str | Permission) -> bool:
+        """
+        Back-compat alias for has_for_user(...), accepting either a raw permission string
+        or a Permission value object.
+        """
+        perm_name = permission.name if isinstance(permission, Permission) else str(permission)
+        return self.has_for_user(user_id, perm_name)
+
+    def reason_for_user(self, user_id: str | UserId, permission: str) -> str:
+        uid = str(user_id) if isinstance(user_id, UserId) else _norm_user_id(user_id)
+        names = self.assignments.get(uid, ())
+        roles = [self.roles[rn] for rn in names if rn in self.roles]
+        if not roles:
+            return "deny: default (no roles)"
+        for r in roles:
+            if r.denies(permission):
+                return f"deny: role {r.name}"
+        for r in roles:
+            if r.allows(permission):
+                return f"allow: role {r.name}"
+        return "deny: default"

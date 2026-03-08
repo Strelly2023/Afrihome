@@ -1,25 +1,34 @@
-#control_plane/application/execution/context_factory.py
+# control_plane/application/execution/context_factory.py
 """
 AfriHome Control Plane — Application/Execution
 PHASE: 3.1 (Orchestration only)
-IO: NONE | Threads/async: NONE | Deterministic: YES 
+IO: NONE | Threads/async: NONE | Deterministic: YES
 """
+
 from typing import Mapping, Optional
+
 from core.context import RequestContext
 from core.execution import ExecutionContext
 from core.identity.uuid import UUIDProvider
-from core.time.clock import Clock
-from core.typing import RequestId, CorrelationId, CausationId, UnixMillis
 from core.kernel.invariants import assert_not_none
+from core.time.clock import Clock
+from core.typing import CausationId, CorrelationId, RequestId, UnixMillis
+
 from .constants import (
-    HDR_REQUEST_ID, HDR_CORRELATION_ID, HDR_CAUSATION_ID,
+    HDR_CAUSATION_ID,
+    HDR_CORRELATION_ID,
+    HDR_REQUEST_ID,
 )
+
 
 def _pick(headers: Mapping[str, str], key: str) -> Optional[str]:
     val = headers.get(key)
     return val.strip() if isinstance(val, str) else None
 
-def build_request_context(headers: Mapping[str, str], clock: Clock, uuid: UUIDProvider) -> RequestContext:
+
+def build_request_context(
+    headers: Mapping[str, str], clock: Clock, uuid: UUIDProvider
+) -> RequestContext:
     """
     Build a core RequestContext deterministically.
     - If IDs are not provided, mint via the deterministic UUID provider.
@@ -43,6 +52,7 @@ def build_request_context(headers: Mapping[str, str], clock: Clock, uuid: UUIDPr
         tenant_id=None,
         user_id=None,
     )
+
 
 def new_execution_context(rc: RequestContext, clock: Clock, uuid: UUIDProvider) -> ExecutionContext:
     """
