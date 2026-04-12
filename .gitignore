@@ -29,4 +29,4 @@ env/
 arch_report.json
 .lint-arch.json
 all_python_files.txt
-afrihome*.txt
+afrihome*.txt.DS_Store
