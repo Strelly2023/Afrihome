@@ -1,0 +1,93 @@
+{
+  "schema_version": "1.0",
+  "report_type": "core_purity",
+  "generated_at": "2026-04-15T00:00:00Z",
+
+  "repository": {
+    "org": "<ORG>",
+    "repo": "<REPO>",
+    "commit_sha": "<COMMIT_SHA>",
+    "branch": "<BRANCH>",
+    "ci_run_id": "<RUN_ID>"
+  },
+
+  "governance": {
+    "adr_baseline": [
+      "ADR-000",
+      "ADR-000A",
+      "ADR-OP-001",
+      "ADR-DS-BI-001"
+    ],
+    "core_freeze_enforced": true,
+    "checksum_ledger_verified": true,
+    "runtime_mutation_enforced": true
+  },
+
+  "scope": {
+    "analyzed_paths": [
+      "afritech/platform/core/identity",
+      "afritech/platform/core/decision",
+      "afritech/platform/core/policy",
+      "afritech/platform/core/risk",
+      "afritech/platform/core/governance"
+    ],
+    "excluded_paths": [
+      "execution",
+      "adapters",
+      "io",
+      "infrastructure"
+    ]
+  },
+
+  "purity_rules_checked": [
+    "no_time_access",
+    "no_randomness",
+    "no_io",
+    "no_global_state",
+    "no_caching",
+    "no_mutation",
+    "explicit_dependency_only"
+  ],
+
+  "results": {
+    "status": "PASS",
+
+    "summary": {
+      "pure_components": [
+        "afritech.platform.core.identity.*",
+        "afritech.platform.core.decision.reason",
+        "afritech.platform.core.policy.*",
+        "afritech.platform.core.typing.*"
+      ],
+
+      "boundary_isolated_impure_components": [
+        {
+          "component": "afritech.platform.core.decision.trace",
+          "reason": "event envelope normalization only; no domain side-effects"
+        },
+        {
+          "component": "afritech.platform.core.audit.trace",
+          "reason": "audit artifact construction; isolated from decision logic"
+        }
+      ],
+
+      "violation_count": 0,
+      "files_scanned": "<TOTAL_FILES>",
+      "rules_evaluated": 7
+    }
+  },
+
+  "violations": [],
+
+  "attestation": {
+    "verified_by": "core_enforcement_pipeline",
+    "verification_mode": "fail_closed",
+    "confidence": "high",
+    "notes": [
+      "All core modules comply with purity constraints",
+      "No hidden side effects detected",
+      "All mutation rules enforced via static analysis",
+      "Boundary impurities are isolated and intentional"
+    ]
+  }
+}

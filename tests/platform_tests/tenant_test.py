@@ -1,4 +1,4 @@
-from core.time.clock import FixedClock
+from afritech.platform.control_plane.time.clock import FixedClock
 from core.typing import UnixMillis, RequestId, CorrelationId, CausationId
 from core.context.request_context import RequestContext
 from core.identity.uuid import DeterministicUUIDProvider

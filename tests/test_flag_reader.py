@@ -5,7 +5,7 @@ from control_plane.application.execution.models import ExecutionFrame, Actor, Ac
 from core.typing import RoleName, TenantId
 from core.execution import ExecutionContext
 from core.context import RequestContext
-from core.time.clock import FixedClock
+from afritech.platform.control_plane.time.clock import FixedClock
 from core.identity.uuid import DeterministicUUIDProvider
 from core.typing import RequestId, CorrelationId, CausationId, UnixMillis
 

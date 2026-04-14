@@ -22,7 +22,7 @@ class _NoGov:
 def _frame_with_roles(*roles: str) -> ExecutionFrame:
     from core.execution import ExecutionContext
     from core.context import RequestContext
-    from core.time.clock import FixedClock
+    from afritech.platform.control_plane.time.clock import FixedClock
     from core.identity.uuid import DeterministicUUIDProvider
     from core.typing import RequestId, CorrelationId, CausationId, UnixMillis
     rc = RequestContext(

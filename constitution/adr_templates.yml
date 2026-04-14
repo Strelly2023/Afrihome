@@ -1,0 +1,82 @@
+classes:
+
+  CO:
+    name: Core Ontology
+    level: Constitutional
+    required_sections:
+      - Ontological Declaration
+      - Non-Existence Declaration
+      - Invariants
+      - Forbidden
+      - Test Requirements
+    forbidden_terms:
+      - runtime
+      - execution
+      - io
+
+  AM:
+    name: Authority Model
+    level: Constitutional
+    required_sections:
+      - Authority Definition
+      - Scope
+      - Invariants
+      - Forbidden
+      - Test Requirements
+    forbidden_terms:
+      - grant
+      - allow
+      - escalation
+
+  DS:
+    name: Decision Semantics
+    level: Constitutional
+    required_sections:
+      - Semantic Rule
+      - Composition Logic
+      - Determinism Guarantee
+      - Invariants
+      - Forbidden
+      - Test Requirements
+    forbidden_terms:
+      - conditional
+      - probabilistic
+      - runtime
+
+  AE:
+    name: Audit & Explainability
+    level: Structural
+    required_sections:
+      - Audit Requirement
+      - Explanation Model
+      - Invariants
+      - Forbidden
+      - Test Requirements
+    forbidden_terms:
+      - logging only
+      - mutable history
+
+  TV:
+    name: Testing & Verification
+    level: Evolution
+    required_sections:
+      - Enforcement Rule
+      - Requirements
+      - Invariants
+      - Forbidden
+      - Test Requirements
+    forbidden_terms:
+      - manual override
+
+  OP:
+    name: Deployment & Operations
+    level: Evolution
+    required_sections:
+      - Deployment Rule
+      - Constraints
+      - Invariants
+      - Forbidden
+      - Test Requirements
+    forbidden_terms:
+      - hotfix bypass
+      - runtime mutation

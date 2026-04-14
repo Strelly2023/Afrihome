@@ -1,0 +1,20 @@
+name: ADR Governance
+
+on: [push, pull_request]
+
+jobs:
+  adr-governance:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate ADR structure
+        run: python tools/adr/validate_templates.py
+
+      - name: Validate ADR enforcement
+        run: python tools/adr/validate_adr_traceability.py

@@ -1,0 +1,54 @@
+repos:
+  - repo: local
+    hooks:
+
+      # -------------------------------------------------
+      # ADR-TV-002 — Future Import Validator
+      # -------------------------------------------------
+      - id: afritech-future-imports
+        name: AfriTech — Enforce Future Import Placement (ADR-TV-002)
+        entry: python3 tools/check_future_imports.py
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [commit]
+
+      # -------------------------------------------------
+      # ADR-BI-003 — Import Boundary Enforcement
+      # -------------------------------------------------
+      - id: afritech-import-boundaries
+        name: AfriTech — Enforce Import Boundaries (ADR-BI-003)
+        entry: python3 tools/check_import_boundaries.py
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [commit]
+
+      # -------------------------------------------------
+      # ADR-BI-004 — Global Mutable State Prohibition
+      # -------------------------------------------------
+      - id: afritech-global-mutable-state
+        name: AfriTech — Prohibit Global Mutable State (ADR-BI-004)
+        entry: python3 tools/check_global_mutable_state.py
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [commit]
+
+      # -------------------------------------------------
+      # ADR-TV-003 — HTML Entity Normalization (Detector Only)
+      # -------------------------------------------------
+      - id: afritech-html-entity-detector
+        name: AfriTech — Detect HTML-Encoded Syntax (ADR-TV-003)
+        entry: python3 tools/fix_html_entities.py --check
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [commit]
+
+      - id: afritech-runtime-mutation
+        name: AfriTech — Runtime Mutation Prohibition (ADR-OP-001)
+        entry: python3 tools/check_runtime_mutation.py
+        language: system
+        pass_filenames: false
+        stages: [commit]

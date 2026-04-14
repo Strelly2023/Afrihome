@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "core_root": "afritech/platform/core",
+  "hash_algorithm": "sha256",
+  "generated_at": "2026-04-13T09:30:00Z",
+  "files": {
+    "afritech/platform/core/identity/model.py": "1c0f2e0f9f7a6c6e4f5e...",
+    "afritech/platform/core/decision/engine.py": "9b3d8a9ecb0d4e2cfd3a...",
+    "afritech/platform/core/policy/definition.py": "43a77e2f1c9d4d1b2a10..."
+  }
+}

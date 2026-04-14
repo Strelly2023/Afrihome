@@ -1,3 +1,4 @@
+from __future__ import annotations
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -23,7 +24,6 @@ python tools/afrihome_lint.py --root . --format text --fail-under 92
 python tools/afrihome_lint.py --root . --format json --fix
 """
 
-from __future__ import annotations
 import argparse
 import json
 import os

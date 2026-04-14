@@ -1,6 +1,6 @@
 
 import pytest
-from core.time.clock import Clock, FixedClock, SystemClock
+from afritech.platform.control_plane.time.clock import Clock, FixedClock, SystemClock
 from core.typing import UnixMillis
 
 

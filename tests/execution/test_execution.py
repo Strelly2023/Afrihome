@@ -3,7 +3,7 @@ import pytest
 from core.execution import ExecutionContext, StrictWriteMode, TransactionBoundary
 from core.context.request_context import RequestContext
 from core.typing import RequestId, CorrelationId, CausationId, UnixMillis
-from core.time.clock import FixedClock
+from afritech.platform.control_plane.time.clock import FixedClock
 from core.identity.uuid import DeterministicUUIDProvider
 from core.errors import InvariantViolationError, StrictWriteViolationError
 
