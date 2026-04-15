@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  afritech-ci:
+    name: AfriTech Constitutional CI
+    runs-on: ubuntu-latest
+
+    steps:
+      # ----------------------------------------------------
+      # Source Control
+      # ----------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------
+      # Python Runtime (Defined & Immutable)
+      # ----------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ----------------------------------------------------
+      # Dependencies
+      # ----------------------------------------------------
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+
+      # ----------------------------------------------------
+      # CORE LAW — THESE DEFINE TRUTH
+      # ----------------------------------------------------
+      - name: Run core decision tests
+        run: |
+          pytest tests/core
+
+      # ----------------------------------------------------
+      # CONSTITUTIONAL GOVERNANCE (SCOPED)
+      # ----------------------------------------------------
+      - name: Run AfriTech governance guards
+        env:
+          AFRITECH_SCOPE_FILE: .afritech-scope
+        run: |
+          python3 -m afritech.guards.run
+
+      # ----------------------------------------------------
+      # INVARIANT DOCUMENTATION (PROOF)
+      # ----------------------------------------------------
+      - name: Generate invariant documentation
+        run: |
+          python3 tools/docgen/extract_invariants.py
+
+      - name: Verify invariants are up to date
+        run: |
+          git diff --exit-code docs/generated/invariants.md
+
+      # ----------------------------------------------------
+      # SUCCESS SUMMARY
+      # ----------------------------------------------------
+      - name: Governance Summary
+        if: success()
+        run: |
+          echo "✅ Governance checks passed (scoped, constitutional)"
+
+        env:
+            AFRITECH_SCOPE_FILE: .afritech-scope

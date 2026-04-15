@@ -1,0 +1,5 @@
+# Only these paths are governed
+afritech/
+config/
+tests/
+adr/

@@ -61,11 +61,6 @@ from afritech.platform.core.identity.identity_status import (
 # Deterministic UUID infrastructure
 # ---------------------------------------------------------------------
 
-from afritech.platform.core.identity.uuid import (
-    UUIDProvider,
-    UuidProvider,
-    DeterministicUUIDProvider,
-)
 
 # ---------------------------------------------------------------------
 # Invariants & validation
