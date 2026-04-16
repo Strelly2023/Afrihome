@@ -1,0 +1,17 @@
+
+id: ADR-005
+status: DRAFT
+
+scope:
+  - afritech/platform/policy
+
+invariants:
+  - deny_overrides_allows
+
+enforcement:
+  guards:
+    - policy_evaluation
+
+tests:
+  - test_deny_wins_policy
+`` --- IGNORE ---

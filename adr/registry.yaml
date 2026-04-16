@@ -1,0 +1,77 @@
+schema_version: 1
+
+# This registry defines the architectural decisions (laws) 
+#that govern the AfriTech codebase. Each law is an immutable  
+#truth that guides development and ensures consistency across the project.
+
+
+# The registry is used by governance guards to enforce compliance with these laws
+ # during development and CI processes.
+
+
+ # Each law is defined in a separate ADR file in the adr/ directory, and this registry
+  #serves as a centralized index of all active laws in the codebase.
+
+  # The registry is also used to track the status of each law (e.g., DRAFT, ACCEPTED) and
+   #to specify any enforcement mechanisms or tests associated with each law.
+
+   # When a new ADR is created or an existing ADR is updated, the registry should be updated
+    #accordingly to reflect the current state of architectural decisions in the project.
+
+  # Example entry in the registry:  
+  # - id: ADR-001
+  #   title: Deterministic Core
+  #   status: ACCEPTED    
+
+  
+
+
+laws:
+  - id: ADR-000
+    title: Constitutional Enforcement
+    status: ACCEPTED
+
+  - id: ADR-001
+    title: Deterministic Core
+    status: ACCEPTED
+
+  - id: ADR-002
+    title: Time Is Injected
+    status: ACCEPTED
+
+  - id: ADR-003
+    title: Entropy Is Injected
+    status: ACCEPTED
+
+  - id: ADR-004
+    title: Identity Is Immutable
+    status: ACCEPTED
+
+  - id: ADR-005
+    title: Deny Wins
+    status: DRAFT
+
+  - id: ADR-006
+    title: Import Boundaries
+    status: ACCEPTED
+
+  - id: ADR-007
+    title: No Global Mutable State
+    status: ACCEPTED
+
+  - id: ADR-008
+    title: Runtime Mutation Ban
+    status: ACCEPTED
+
+  - id: ADR-009
+    title: Public API Freeze
+    status: ACCEPTED
+
+  - id: ADR-010
+    title: Legacy Is Explicit
+    status: ACCEPTED
+
+  - id: ADR-011
+    title: Governance Requires Governance
+    status: DRAFT
+``

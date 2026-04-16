@@ -1,0 +1,11 @@
+id: ADR-010
+status: ACCEPTED
+
+invariants:
+  - legacy_out_of_scope
+
+enforcement:
+  mechanism:
+    - .LEGACY
+    - .afritech-scope
+    - guards.scope

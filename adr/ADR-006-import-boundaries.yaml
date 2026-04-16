@@ -1,0 +1,14 @@
+id: ADR-006
+status: ACCEPTED
+
+layers:
+  core:
+    may_import: []
+  platform:
+    may_import: [core]
+  infrastructure:
+    may_import: [platform]
+
+enforcement:
+  guards:
+    - import_boundaries

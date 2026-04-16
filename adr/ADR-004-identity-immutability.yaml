@@ -1,0 +1,17 @@
+id: ADR-004
+status: ACCEPTED
+
+scope:
+  - afritech/platform/core/identity
+
+invariants:
+  - identity_is_value_object
+  - no_field_mutation
+
+enforcement:
+  guards:
+    - runtime_mutation
+
+tests:
+  - test_identity_immutability
+`` --- IGNORE ---

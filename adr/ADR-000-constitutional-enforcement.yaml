@@ -1,0 +1,31 @@
+# This ADR establishes the principle of constitutional enforcement for all laws in the Afrihome project. It mandates that every law must have a defined enforcement mechanism, ensuring that governance is not just theoretical but actively upheld through guards and tests. This is essential for maintaining the integrity and consistency of the project's governance framework.
+# Key principles of constitutional enforcement include:
+# 1. Every law must have an associated enforcement mechanism, which can include guards, CI checks, or other tools that ensure compliance with the law.
+# 2. Enforcement mechanisms must be clearly defined and documented within the ADR, providing transparency and clarity for developers.
+# 3. The enforcement of laws must be integrated into the development workflow, including local commits and CI processes, to ensure that governance is upheld at all stages of development.
+# 4. Failure to comply with the enforcement mechanisms should result in clear feedback to developers, guiding them to resolve issues and maintain compliance with the project's governance framework.   
+
+id: ADR-000
+type: CONSTITUTIONAL
+status: ACCEPTED
+
+scope:
+  - "*"
+
+invariants:
+  - guards cannot be bypassed
+  - CI must enforce governance
+  - local commits must enforce governance
+
+enforcement:
+  entrypoint: afritech.guards.run
+  tools:
+    - precommit
+    - ci
+
+tests:
+  - test_governance_runner_cannot_be_skipped
+
+failure:
+  mode: BLOCK_MERGE
+  message: "Governance guards must pass before merging. Please fix the issues and try again."

@@ -1,0 +1,13 @@
+id: ADR-009
+status: ACCEPTED
+
+scope:
+  - afritech/platform/core
+
+invariants:
+  - public_api_static
+
+enforcement:
+  tests:
+    - test_core_public_api_stability
+`` --- IGNORE ---

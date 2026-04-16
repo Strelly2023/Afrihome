@@ -1,0 +1,24 @@
+# This ADR establishes the principle of entropy injection for all randomness-related operations in the Afrihome project. It mandates that all code must use injected sources of randomness instead of direct calls to random functions, ensuring that randomness-dependent logic is testable and consistent across different environments.
+# Key principles of entropy injection include:
+# 1. No Direct Randomness Access: Code should not directly call functions from the random module or similar sources of randomness. Instead, it should rely on injected randomness providers that can be controlled and manipulated during testing.
+# 2. Testability: By using injected randomness providers, developers can write tests that simulate different randomness scenarios, such as fixed random values or controlled random sequences, without relying on actual random generation.
+# 3. Consistency: Entropy injection helps ensure that randomness-dependent logic behaves consistently across different environments, such as development, testing, and production, by allowing for controlled randomness manipulation.
+# 4. Enforcement through Guards: The principle of entropy injection should be enforced through guards that prevent direct access to random functions. These guards should be integrated into the development workflow to catch any violations early and ensure that all randomness-related code adheres to the principle of entropy injection.
+# 5. Testing for Entropy Injection: Tests should be implemented to verify that all randomness-related code uses injected randomness providers, and that any attempts to access random functions directly are properly caught and addressed. This includes tests that validate the use of entropy injection and ensure that randomness-dependent logic behaves as expected under different randomness scenarios. 
+
+id: ADR-003
+status: ACCEPTED
+
+scope:
+  - afritech/platform/core
+
+invariants:
+  - no_random_module
+  - deterministic_uuid_provider_only
+
+enforcement:
+  guards:
+    - randomness_access
+
+tests:
+  - test_deterministic_uuid_provider

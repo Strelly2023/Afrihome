@@ -1,0 +1,29 @@
+# This ADR defines the principle of a deterministic core for the Afrihome project. It establishes that the core components of the platform must be deterministic, meaning they should produce the same output given the same input, regardless of external factors such as time, randomness, or I/O operations. This is crucial for ensuring reliability, predictability, and ease of testing within the core of the platform.
+# Key principles of the deterministic core include:
+# 1. No Time Access: Core components should not access the current time or system clock, as this can lead to non-deterministic behavior. Instead, any time-related functionality should be injected as a dependency, allowing for controlled and testable time manipulation.
+# 2. No Randomness: Core components should not generate random numbers or access random sources directly. Any randomness should be injected as a dependency, enabling deterministic behavior and easier testing.
+# 3. No I/O Operations: Core components should not perform input/output operations, such as reading from or writing to files, databases, or network. This ensures that the core remains pure and deterministic, and any necessary I/O should be handled by separate layers of the application that can be mocked or stubbed during testing.
+# 4. Enforcement through Guards: The principles of the deterministic core should be enforced through guards that prevent access to time, randomness, and I/O operations within the core. These guards should be integrated into the development workflow to ensure that any violations are caught early and addressed promptly.
+# 5. Testing for Determinism: Tests should be implemented to verify that core components behave deterministically, producing the same output for the same input. This includes tests that validate the purity of core functions and ensure that any dependencies related to time, randomness, or I/O are properly injected and controlled during testing.   
+
+id: ADR-001
+status: ACCEPTED
+type: CORE
+
+scope:
+  - afritech/platform/core
+
+invariants:
+  - no_time_access
+  - no_randomness
+  - no_io
+
+enforcement:
+  guards:
+    - core_purity
+    - time_access
+    - randomness_access
+
+tests:
+  - test_identity_determinism
+  - test_core_purity

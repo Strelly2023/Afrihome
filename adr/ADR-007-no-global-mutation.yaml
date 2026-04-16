@@ -1,0 +1,10 @@
+id: ADR-007
+status: ACCEPTED
+
+invariants:
+  - no_global_mutation
+
+enforcement:
+  guards:
+    - global_mutable_state
+`` --- IGNORE --- 

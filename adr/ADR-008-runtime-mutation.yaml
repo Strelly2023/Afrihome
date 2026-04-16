@@ -1,0 +1,10 @@
+id: ADR-008
+status: ACCEPTED
+
+invariants:
+  - mutation_only_in_init
+
+enforcement:
+  guards:
+    - runtime_mutation
+`` --- IGNORE --- 

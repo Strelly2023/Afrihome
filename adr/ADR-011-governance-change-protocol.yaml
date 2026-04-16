@@ -1,0 +1,23 @@
+# This ADR defines the protocol for making changes to the governance structure of the Afrihome project.
+# It establishes the requirement for creating an ADR for any proposed changes to the governance model,
+# including changes to the registry, enforcement mechanisms, or the introduction of new guards.
+# The protocol ensures that all governance changes are documented, reviewed, and tested before implementation.
+# Key principles of the governance change protocol include:
+# 1. Transparency: All proposed changes must be documented in an ADR and made available for review by the community.
+# 2. Accountability: Proposers of governance changes are responsible for providing a clear rationale for the change, 
+    #as well as any necessary tests to validate the change.
+# 3. Consensus: Governance changes should be made with the consensus of the community, 
+      #ensuring that all stakeholders have a voice in the decision-making process.
+# 4. Stability: Changes to governance should be made with consideration for the stability 
+      #of the project, avoiding unnecessary disruptions to development and CI processes. 
+
+id: ADR-011
+status: DRAFT
+
+invariants:
+  - guard_change_requires_adr
+  - adr_change_requires_tests
+
+enforcement:
+  ci:
+    - adr_registry_validation

@@ -1,0 +1,24 @@
+# This ADR establishes the principle of time injection for all time-related operations in the Afrihome project. It mandates that all code must use injected time sources instead of direct calls to system time functions, ensuring that time-dependent logic is testable and consistent across different environments.
+# Key principles of time injection include:
+# 1. No Direct Time Access: Code should not directly call functions like datetime.now() or time.time(). Instead, it should rely on injected time sources that can be controlled and manipulated during testing.
+# 2. Testability: By using injected time sources, developers can write tests that simulate different time scenarios, such as time travel or fixed timestamps, without relying on the actual system clock.
+# 3. Consistency: Time injection helps ensure that time-dependent logic behaves consistently across different environments, such as development, testing, and production, by allowing for controlled time manipulation.
+# 4. Enforcement through Guards: The principle of time injection should be enforced through guards that prevent direct access to system time functions. These guards should be integrated into the development workflow to catch any violations early and ensure that all time-related code adheres to the principle of time injection.
+# 5. Testing for Time Injection: Tests should be implemented to verify that all time-related code uses injected time sources, and that any attempts to access system time directly are properly caught and addressed. This includes tests that validate the use of time injection and ensure that time-dependent logic behaves as expected under different time scenarios.    
+
+id: ADR-002
+status: ACCEPTED
+
+scope:
+  - afritech/platform/core
+
+invariants:
+  - no_datetime_now
+  - no_system_clock_calls
+
+enforcement:
+  guards:
+    - time_access
+
+tests:
+  - test_clock_is_injected
