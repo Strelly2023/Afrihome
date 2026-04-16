@@ -1,0 +1,29 @@
+# ----------------------------------------------------------------------
+# Domain Integrity Rules
+#
+# These rules govern correctness and purity of the domain model.
+# Most are enforced via tests today and will gain static guards later.
+# ----------------------------------------------------------------------
+
+scope: afritech/platform/domain
+
+rules:
+  - id: DOM-001
+    type: type_guard
+    description: No stringly-typed enums in domain models
+    enforcement: test_only
+
+  - id: DOM-002
+    type: immutability
+    description: Domain value objects must be immutable
+    enforcement: test_only
+
+  - id: DOM-003
+    type: explicit_mapping
+    description: DTO ↔ Domain mapping must be explicit
+    enforcement: test_only
+
+  - id: DOM-004
+    type: boundary_guard
+    description: Infrastructure models must not leak into domain
+    enforcement: test_only

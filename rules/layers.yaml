@@ -1,0 +1,22 @@
+category: LAYER
+
+rules:
+  - id: LAYER-001
+    type: forbidden_import
+    description: Core must not depend on higher implementation layers
+    scope:
+      include:
+        - afritech/platform/core/
+      exclude:
+        - tests/
+    forbidden:
+      - afritech.platform.control_plane
+      - afritech.platform.infra
+
+  - id: LAYER-005
+    type: no_cycles
+    description: Dependency graph must be acyclic
+    scope:
+      include:
+        - afritech/platform/
+    enforcement: test_only

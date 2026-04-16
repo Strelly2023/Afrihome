@@ -1,0 +1,15 @@
+category: DECISION
+
+rules:
+  - id: DEC-001
+    type: pipeline_order
+    order: [rbac, policy, quota, risk, consent]
+
+  - id: DEC-002
+    type: deny_wins
+
+  - id: DEC-004
+    type: no_short_circuit
+
+  - id: DEC-005
+    type: typed_outcome

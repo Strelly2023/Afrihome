@@ -1,0 +1,27 @@
+category: CORE
+scope: afritech/platform/core
+
+rules:
+  - id: CORE-001
+    type: forbidden_import
+    forbidden: [requests, httpx]
+    description: No IO libraries in core
+
+  - id: CORE-002
+    type: forbidden_import
+    forbidden: [datetime, time]
+    description: No time access
+
+  - id: CORE-003
+    type: forbidden_import
+    forbidden: [random]
+    description: No randomness
+
+  - id: CORE-004
+    type: forbidden_call
+    forbidden_calls: [open, Path.read_text]
+    description: No filesystem access
+
+  - id: CORE-007
+    type: no_global_state
+    description: No module-level mutation
