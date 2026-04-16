@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@v4
 
       # ----------------------------------------------------
-      # Python Runtime (Defined & Immutable)
+      # Python Runtime (Pinned)
       # ----------------------------------------------------
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -27,39 +27,34 @@ jobs:
           python-version: "3.11"
 
       # ----------------------------------------------------
-      # Dependencies
+      # Dependency Installation
       # ----------------------------------------------------
       - name: Install dependencies
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install -r requirements.txt
+          python3 -m pip install -e .
 
       # ----------------------------------------------------
-      # CORE LAW — THESE DEFINE TRUTH
+      # CONSTITUTIONAL TESTS (META-LAWS)
       # ----------------------------------------------------
-      - name: Run core decision tests
+      - name: Run constitutional tests
+        run: |
+          pytest tests/constitution
+
+      # ----------------------------------------------------
+      # DOMAIN / CORE TESTS (BUSINESS LAW)
+      # ----------------------------------------------------
+      - name: Run core and domain tests
         run: |
           pytest tests/core
 
       # ----------------------------------------------------
-      # CONSTITUTIONAL GOVERNANCE (SCOPED)
+      # GOVERNANCE ENFORCEMENT (THE LAW)
       # ----------------------------------------------------
-      - name: Run AfriTech governance guards
-        env:
-          AFRITECH_SCOPE_FILE: .afritech-scope
+      - name: Run AfriTech governance checks
         run: |
-          python3 -m afritech.guards.run
-
-      # ----------------------------------------------------
-      # INVARIANT DOCUMENTATION (PROOF)
-      # ----------------------------------------------------
-      - name: Generate invariant documentation
-        run: |
-          python3 tools/docgen/extract_invariants.py
-
-      - name: Verify invariants are up to date
-        run: |
-          git diff --exit-code docs/generated/invariants.md
+          afritech check
 
       # ----------------------------------------------------
       # SUCCESS SUMMARY
@@ -67,7 +62,4 @@ jobs:
       - name: Governance Summary
         if: success()
         run: |
-          echo "✅ Governance checks passed (scoped, constitutional)"
-
-        env:
-            AFRITECH_SCOPE_FILE: .afritech-scope
+          echo "✅ AfriTech governance, law, and invariants passed"

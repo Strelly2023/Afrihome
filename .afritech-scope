@@ -1,4 +1,26 @@
-# Only these paths are governed
+# ---------------------------------------------------------------------
+# AfriTech Governance Scope Declaration
+# ---------------------------------------------------------------------
+#
+# This file documents the high-level directories intended to be governed
+# by AfriTech constitutional rules.
+#
+# NOTE:
+# - This file is DECLARATIVE and HUMAN-READABLE.
+# - It is NOT executable and is NOT the source of truth.
+# - Actual enforcement scope is defined in:
+#       afritech/guards/scope.py
+#
+# This file exists for:
+#   - documentation
+#   - onboarding
+#   - architectural clarity
+#   - future tooling (optional)
+#
+# ---------------------------------------------------------------------
+# Governed Paths
+# ---------------------------------------------------------------------
+
 afritech/
 config/
 tests/

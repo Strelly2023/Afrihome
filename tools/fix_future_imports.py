@@ -1,88 +1,169 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+"""
+AfriTech Utility — fix_future_imports
+====================================
+
+Normalize or remove `from __future__ import annotations`
+across a Python codebase.
+
+Modes:
+- remove : delete all occurrences (recommended for Python >= 3.11)
+- move   : ensure it appears immediately after the module docstring
+           (PEP 236 / PEP 257 compliant)
+
+Features:
+- Safe dry-run mode (no file writes)
+- Skips virtualenvs and site-packages
+- Preserves shebangs, encoding headers, and trailing newlines
+- Idempotent and pre-commit friendly
+"""
+
 import argparse
 from pathlib import Path
+from typing import Iterable
 
-SKIP = ("venv", ".venv", ".tox", "site-packages")
+# ---------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------
+
 FUTURE_LINE = "from __future__ import annotations"
 
-def should_skip(p: Path) -> bool:
-    return any(part in SKIP for part in p.parts)
+SKIP_DIRS = {
+    "venv",
+    ".venv",
+    ".tox",
+    "site-packages",
+    "__pycache__",
+}
 
-def fix_file(path: Path, mode: str) -> bool:
+ENCODING_PREFIXES = ("# -*- coding:", "# coding:")
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+def should_skip(path: Path) -> bool:
+    return any(part in SKIP_DIRS for part in path.parts)
+
+
+def find_future_imports(lines: list[str]) -> list[int]:
+    return [i for i, ln in enumerate(lines) if ln.strip() == FUTURE_LINE]
+
+
+def find_insertion_point(lines: list[str]) -> int:
+    i = 0
+
+    # Shebang
+    if i < len(lines) and lines[i].startswith("#!"):
+        i += 1
+
+    # Encoding declaration(s)
+    while i < len(lines) and any(lines[i].startswith(pfx) for pfx in ENCODING_PREFIXES):
+        i += 1
+
+    # Module docstring
+    if i < len(lines) and lines[i].lstrip().startswith(('"""', "'''")):
+        quote = lines[i].lstrip()[:3]
+
+        # Single-line docstring
+        if lines[i].count(quote) >= 2:
+            return i + 1
+
+        # Multi-line docstring
+        i += 1
+        while i < len(lines):
+            if quote in lines[i]:
+                return i + 1
+            i += 1
+
+    return i
+
+
+def write_if_changed(path: Path, original: str, updated: str) -> bool:
+    if original == updated:
+        return False
+    path.write_text(updated, encoding="utf-8")
+    return True
+
+# ---------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------
+
+def fix_file(path: Path, *, mode: str, dry_run: bool) -> bool:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
+    had_trailing_newline = text.endswith("\n")
 
-    # Find future import lines
-    idxs = [i for i, ln in enumerate(lines) if ln.strip() == FUTURE_LINE]
+    idxs = find_future_imports(lines)
     if not idxs:
         return False
 
-    if mode == "remove":
-        for i in reversed(idxs):
-            del lines[i]
-        path.write_text("\n".join(lines) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
-        return True
+    new_lines = list(lines)
+
+    # Remove all existing future imports
+    for idx in reversed(idxs):
+        del new_lines[idx]
 
     if mode == "move":
-        had_future = False
-        for i in reversed(idxs):
-            had_future = True
-            del lines[i]
-        if not had_future:
-            return False
+        insert_at = find_insertion_point(new_lines)
+        new_lines.insert(insert_at, FUTURE_LINE)
 
-        # Find insertion point: after module docstring if present
-        insert_at = 0
-        # Skip shebang/encoding
-        while insert_at < len(lines) and (
-            lines[insert_at].startswith("#!") or lines[insert_at].startswith("# -*- coding:")
+        if (
+            insert_at + 1 < len(new_lines)
+            and new_lines[insert_at + 1].strip() != ""
         ):
-            insert_at += 1
-        # Module docstring?
-        if insert_at < len(lines) and lines[insert_at].lstrip().startswith(('"""', "'''")):
-            quote = lines[insert_at].lstrip()[:3]
-            j = insert_at
-            if lines[j].count(quote) >= 2:
-                insert_at = j + 1
-            else:
-                j += 1
-                while j < len(lines):
-                    if quote in lines[j]:
-                        insert_at = j + 1
-                        break
-                    j += 1
-        needs_blank = insert_at < len(lines) and lines[insert_at].strip() != ""
-        lines.insert(insert_at, "from __future__ import annotations")
-        if needs_blank:
-            lines.insert(insert_at + 1, "")
-        path.write_text("\n".join(lines) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
+            new_lines.insert(insert_at + 1, "")
+
+    elif mode != "remove":
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    updated = "\n".join(new_lines)
+    if had_trailing_newline:
+        updated += "\n"
+
+    if dry_run:
         return True
 
-    return False
+    return write_if_changed(path, text, updated)
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["remove", "move"], default="remove",
-                    help="remove (Py3.11+) or move future import below module docstring")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--root", default=".", help="project root")
-    args = ap.parse_args()
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+def iter_python_files(root: Path) -> Iterable[Path]:
+    for path in root.rglob("*.py"):
+        if not should_skip(path):
+            yield path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Normalize or remove future annotations imports."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("remove", "move"),
+        default="remove",
+        help="remove (Py>=3.11) or move below module docstring",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="Do not write files")
+    parser.add_argument("--root", default=".", help="Project root")
+
+    args = parser.parse_args()
+    root = Path(args.root)
 
     changed = 0
-    for p in Path(args.root).rglob("*.py"):
-        if should_skip(p):
-            continue
-        if args.dry_run:
-            before = p.read_text(encoding="utf-8")
-            if "from __future__ import annotations" in before and fix_file(p, args.mode):
-                # revert (simulate)
-                p.write_text(before, encoding="utf-8")
-                print(f"[DRY] would fix: {p}")
-                changed += 1
-        else:
-            if fix_file(p, args.mode):
-                print(f"fixed: {p}")
-                changed += 1
-    print(f"\n{changed} file(s) {'would be ' if args.dry_run else ''}fixed.")
+    for py_file in iter_python_files(root):
+        if fix_file(py_file, mode=args.mode, dry_run=args.dry_run):
+            label = "[DRY] would fix" if args.dry_run else "fixed"
+            print(f"{label}: {py_file}")
+            changed += 1
+
+    suffix = "would be " if args.dry_run else ""
+    print(f"\n{changed} file(s) {suffix}fixed.")
+
 
 if __name__ == "__main__":
     main()

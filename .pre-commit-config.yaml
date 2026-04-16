@@ -7,22 +7,48 @@ repos:
       # =================================================
       - id: afritech-governance
         name: AfriTech — Constitutional Governance Enforcement
-        entry: python3 -m afritech.guards.run
+
+        # IMPORTANT:
+        # Use the public CLI, exactly like CI does.
+        entry: afritech check
         language: system
 
-        # Pre-commit must NOT pass filenames
+        # Governance operates at repository intent level,
+        # never file-by-file.
         pass_filenames: false
 
-        # Scope enforcement at the hook level
-        files: ^(afritech/|config/|tests/|adr/)
+        # -------------------------------------------------
+        # When to run
+        # -------------------------------------------------
+        # Only run when governed code or laws change.
+        # This avoids blocking commits for unrelated changes
+        # (README edits, notes, assets, etc.).
+        files: |
+          (?x)^(
+            afritech/ |
+            rules/    |
+            adr/      |
+            config/   |
+            tests/constitution/
+          )
+
+        # -------------------------------------------------
+        # Explicit exclusions
+        # -------------------------------------------------
+        # These are outside constitutional jurisdiction.
         exclude: |
           (?x)^(
-            tools/|
-            _quarantine/|
-            architecture/|
-            contracts/|
-            docs/|
+            tools/ |
+            _quarantine/ |
+            architecture/ |
+            contracts/ |
+            docs/ |
             .*\.LEGACY$
           )
 
+        # -------------------------------------------------
+        # Stage
+        # -------------------------------------------------
+        # Modern pre-commit requires 'pre-commit'
+        # (NOT 'commit', which is deprecated).
         stages: [pre-commit]
