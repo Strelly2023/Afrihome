@@ -1,0 +1,27 @@
+name: Hygiene
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Linter
+        run: |
+          python3 afritech/tools/afritech_lint.py --root afritech --format json > result.json
+
+      - name: Validate Snapshot
+        run: |
+          python3 -c "from afritech.tools.snapshot_guard import assert_snapshot_stable; 
+          import json; 
+          from afritech.tools.afritech_lint import lint; 
+          report = lint('afritech'); assert_snapshot_stable(report)"

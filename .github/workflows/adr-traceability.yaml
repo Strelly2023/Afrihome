@@ -1,6 +1,8 @@
 name: ADR Traceability Enforcement
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
 
 jobs:
   adr-traceability:
@@ -14,5 +16,4 @@ jobs:
           python-version: "3.11"
 
       - name: Validate ADR Traceability
-        run: |
-          python tools/adr/validate_adr_traceability.py
+        run: python3 afritech/tools/adr/validate_adr_traceability.py

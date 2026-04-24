@@ -2,53 +2,83 @@ repos:
   - repo: local
     hooks:
 
-      # =================================================
+      # =============================================================
       # AfriTech Constitutional Governance Hook
-      # =================================================
+      # =============================================================
+      #
+      # This hook enforces AfriTech constitutional governance
+      # at commit time.
+      #
+      # IMPORTANT:
+      # - Uses the PUBLIC CLI (`afritech check`)
+      # - Same entrypoint as CI (no drift)
+      # - Operates on repository intent, NOT individual files
+      #
+      # Any change to this hook requires an ADR.
+      #
+      # =============================================================
       - id: afritech-governance
         name: AfriTech — Constitutional Governance Enforcement
 
-        # IMPORTANT:
-        # Use the public CLI, exactly like CI does.
+        # -------------------------------------------------------------
+        # Execution
+        # -------------------------------------------------------------
+        # Always invoke the same command CI uses.
+        # No flags, no bypasses, no local shortcuts.
         entry: afritech check
         language: system
 
-        # Governance operates at repository intent level,
-        # never file-by-file.
+        # Governance is repository-level, not file-level.
         pass_filenames: false
 
-        # -------------------------------------------------
-        # When to run
-        # -------------------------------------------------
-        # Only run when governed code or laws change.
-        # This avoids blocking commits for unrelated changes
-        # (README edits, notes, assets, etc.).
+        # -------------------------------------------------------------
+        # When to run (JURISDICTIONAL ALIGNMENT)
+        # -------------------------------------------------------------
+        # This MUST align with `.afritech-scope.yml`.
+        #
+        # Governed roots:
+        #   - afritech/
+        #   - config/
+        #   - tests/
+        #   - adr/
+        #
+        # If this list and scope ever diverge,
+        # CI must fail via scope guard.
         files: |
           (?x)^(
             afritech/ |
-            rules/    |
-            adr/      |
             config/   |
-            tests/constitution/
+            tests/    |
+            adr/
           )
 
-        # -------------------------------------------------
-        # Explicit exclusions
-        # -------------------------------------------------
-        # These are outside constitutional jurisdiction.
+        # -------------------------------------------------------------
+        # Explicit exclusions (DENY-FIRST)
+        # -------------------------------------------------------------
+        # These mirrors `.afritech-scope.yml ignored_roots`.
+        # Governance MUST NEVER self-govern its tools.
         exclude: |
           (?x)^(
             tools/ |
+            dev_tools/ |
             _quarantine/ |
-            architecture/ |
             contracts/ |
             docs/ |
+            architecture/ |
+            legacy_tools/ |
+            venv/ |
+            \.venv/ |
+            \.git/ |
+            \.mypy_cache/ |
+            \.pytest_cache/ |
+            \.tox/ |
+            .*__pycache__/ |
             .*\.LEGACY$
           )
 
-        # -------------------------------------------------
+        # -------------------------------------------------------------
         # Stage
-        # -------------------------------------------------
-        # Modern pre-commit requires 'pre-commit'
-        # (NOT 'commit', which is deprecated).
+        # -------------------------------------------------------------
+        # Modern pre-commit requires `pre-commit`
+        # (`commit` is deprecated and must not be used).
         stages: [pre-commit]

@@ -1,0 +1,131 @@
+# =====================================================================
+# AfriTech Constitutional Governance Scope (GA+++ ELITE)
+# =====================================================================
+#
+# This file defines the JURISDICTION of AfriTech constitutional
+# governance — i.e. WHAT parts of the repository are governed.
+#
+# IMPORTANT (NON-NEGOTIABLE):
+# - This file defines SCOPE ONLY (jurisdiction), not rules, policy, or law.
+# - All semantic law exists exclusively in invariants.yaml.
+# - Enforcement logic lives in: afritech/guards/scope.py
+# - Any change to this file is a GOVERNANCE CHANGE and REQUIRES an ADR.
+#
+# If this file and enforcement logic EVER disagree, CI MUST FAIL.
+#
+# This file is CONSTITUTIONAL and ADR‑protected.
+# =====================================================================
+
+version: 1
+
+# ---------------------------------------------------------------------
+# Governed Roots (INCLUSION SET)
+# ---------------------------------------------------------------------
+#
+# Paths listed here are INCLUDED in constitutional enforcement
+# unless explicitly excluded below.
+#
+# Semantics:
+# - Matching is directory‑component based (not naive prefix matching)
+# - Governance is DENY‑FIRST:
+#     exclusions override inclusions
+# ---------------------------------------------------------------------
+
+governed_roots:
+  - afritech/
+  - config/
+  - tests/
+  - adr/
+
+# ---------------------------------------------------------------------
+# Ignored / Excluded Roots (ABSOLUTE EXCLUSIONS)
+# ---------------------------------------------------------------------
+#
+# Paths listed here are NEVER governed, regardless of location.
+#
+# These exclusions are ABSOLUTE.
+# Nothing under these paths may be governed unless THIS FILE changes
+# and the change is justified by an ADR.
+# ---------------------------------------------------------------------
+
+ignored_roots:
+
+  # -------------------------------------------------
+  # Explicit legacy or quarantined code
+  # -------------------------------------------------
+  - _quarantine/
+
+  # -------------------------------------------------
+  # Documentation & diagrams (non‑normative)
+  # -------------------------------------------------
+  - docs/
+  - architecture/
+  - legacy_tools/
+
+  # -------------------------------------------------
+  # Governance tooling (MUST NEVER GOVERN ITSELF)
+  #
+  # Governance enforces execution;
+  # it must not introspect, mutate, or enforce itself.
+  # -------------------------------------------------
+  - tools/
+  - dev_tools/
+
+  # -------------------------------------------------
+  # Historical / deprecated APIs
+  # -------------------------------------------------
+  - contracts/
+
+  # -------------------------------------------------
+  # Virtual environments & caches
+  # -------------------------------------------------
+  - venv/
+  - .venv/
+  - .git/
+  - .mypy_cache/
+  - .pytest_cache/
+  - .tox/
+  - "__pycache__"
+  - "**/__pycache__"
+
+# ---------------------------------------------------------------------
+# Legacy Opt‑Out Marker
+# ---------------------------------------------------------------------
+#
+# Presence of a `.LEGACY` marker file in any directory:
+#
+# - Excludes that directory AND its entire subtree
+# - Takes precedence over governed_roots
+# - Overrides ALL other scope rules
+#
+# This mechanism exists ONLY for controlled legacy isolation.
+#
+# Introducing or removing a `.LEGACY` marker:
+# - IS a governance change
+# - MUST be ADR‑justified
+# - MUST be mechanically enforced by CI
+# ---------------------------------------------------------------------
+
+legacy_marker: ".LEGACY"
+
+# ---------------------------------------------------------------------
+# Authoritative Notes (SCOPE CONSTITUTION)
+# ---------------------------------------------------------------------
+#
+# - Exclusion is deny‑first and explicit.
+# - Tests are INTENTIONALLY governed.
+# - No implicit exclusions exist.
+#
+# Scope decisions are NOT influenced by:
+# - environment variables
+# - CI configuration
+# - tooling flags
+# - runtime parameters
+#
+# Any deviation from this contract MUST be:
+# - deliberate
+# - ADR‑documented
+# - mechanically enforced
+#
+# =====================================================================
+ 

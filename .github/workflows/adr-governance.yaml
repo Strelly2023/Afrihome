@@ -7,121 +7,141 @@ on:
     branches: [main]
 
 # ============================================================
-# GLOBAL SAFETY
+# GLOBAL SAFETY — COURT DISCIPLINE
 # ============================================================
 concurrency:
   group: afritech-ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  PYTHON_VERSION: "3.11"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_PYTHON_VERSION_WARNING: "1"
 
 jobs:
 
 # ============================================================
-# JOB 1 — CONSTITUTION
+# JOB 1 — CONSTITUTION (LAW VALIDITY)
 # ============================================================
   constitution:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - run: |
+      - name: Install dependencies (deterministic)
+        run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
 
-      - run: pytest tests/constitution -v
+      - name: Verify constitutional invariants
+        run: |
+          pytest tests/constitution -v
 
 
 # ============================================================
-# JOB 2 — CORE
+# JOB 2 — CORE (SEMANTIC IMMUTABILITY)
 # ============================================================
   core:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: constitution
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - run: |
+      - name: Install dependencies (deterministic)
+        run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
 
-      - run: pytest tests/core -v
+      - name: Verify core semantics
+        run: |
+          pytest tests/core -v
 
 
 # ============================================================
-# JOB 3 — GOVERNANCE
+# JOB 3 — GOVERNANCE (COURT EXECUTION)
 # ============================================================
   governance:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     needs: core
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - run: |
-          pip install -r requirements.txt
-          pip install -e .
-
-      # --------------------------------------------------------
-      # Build manifest
-      # --------------------------------------------------------
-      - name: Build ExecutionManifest
+      - name: Install governance runtime
         run: |
-          python3 - <<'PY'
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -e .
+
+      # --------------------------------------------------------
+      # Build canonical Execution Manifest
+      # --------------------------------------------------------
+      - name: Build Execution Manifest
+        run: |
+          python - <<'PY'
+          from pathlib import Path
           from afritech.governance.ownership.compiler_v2 import compile_ownership_v2
           from afritech.governance.execution.compiler_v1 import compile_execution_manifest
-          from pathlib import Path
 
-          plan = compile_ownership_v2(Path('afritech/governance/ownership/registry.json'))
+          plan = compile_ownership_v2(Path("afritech/governance/ownership/registry.json"))
           manifest = compile_execution_manifest(plan)
 
-          Path('build').mkdir(exist_ok=True)
-          Path('build/execution_manifest.json').write_text(manifest.to_json())
-          Path('build/manifest.hash').write_text(manifest.manifest_hash)
+          Path("build").mkdir(exist_ok=True)
+          Path("build/execution_manifest.json").write_text(manifest.to_json())
+          Path("build/manifest.hash").write_text(manifest.manifest_hash)
           PY
 
       # --------------------------------------------------------
-      # Run governance
+      # Constitutional governance enforcement
       # --------------------------------------------------------
-      - run: afritech check --manifest build/execution_manifest.json
+      - name: Run constitutional governance
+        run: |
+          afritech check --manifest build/execution_manifest.json
 
       # --------------------------------------------------------
-      # Generate trace (DETERMINISTIC)
+      # Deterministic trace generation
       # --------------------------------------------------------
-      - name: Generate Execution Trace
+      - name: Generate deterministic execution trace
         run: |
-          python3 - <<'PY'
+          python - <<'PY'
+          from pathlib import Path
           from afritech.governance.runtime.execution_trace_collector import collect_trace
           from afritech.governance.runtime.trace_replay_validator import (
+              canonicalize_trace,
               compute_trace_hash,
-              canonicalize_trace
           )
-          from pathlib import Path
 
           trace = collect_trace()
-
           canonical = canonicalize_trace(trace)
           trace_hash = compute_trace_hash(trace)
 
-          Path('build/trace.json').write_text(canonical)
-          Path('build/trace.hash').write_text(trace_hash)
+          Path("build/trace.json").write_text(canonical)
+          Path("build/trace.hash").write_text(trace_hash)
           PY
 
       # --------------------------------------------------------
-      # Compute ENV HASH (REAL)
+      # Compute real environment hash (non‑fictional)
       # --------------------------------------------------------
       - name: Compute environment hash
         run: |
-          python3 - <<'PY'
+          python - <<'PY'
           import hashlib, platform, sys
 
           payload = {
@@ -129,39 +149,35 @@ jobs:
               "platform": platform.platform(),
           }
 
-          raw = str(sorted(payload.items()))
+          raw = repr(sorted(payload.items()))
           h = hashlib.sha256(raw.encode()).hexdigest()
-
-          open('build/env.hash', 'w').write(h)
+          open("build/env.hash", "w").write(h)
           PY
 
       # --------------------------------------------------------
-      # Build attestation
+      # Build execution attestation
       # --------------------------------------------------------
-      - name: Build Execution Attestation
+      - name: Build execution attestation
         run: |
-          python3 - <<'PY'
+          python - <<'PY'
+          from pathlib import Path
           from afritech.governance.runtime.execution_attestation import (
               ExecutionAttestation,
-              compute_attestation_hash
+              compute_attestation_hash,
           )
-          from pathlib import Path
 
           att = ExecutionAttestation(
-              manifest_hash=Path('build/manifest.hash').read_text().strip(),
-              trace_hash=Path('build/trace.hash').read_text().strip(),
-              env_hash=Path('build/env.hash').read_text().strip(),
-              ci_run_id="${{ github.run_id }}"
+              manifest_hash=Path("build/manifest.hash").read_text().strip(),
+              trace_hash=Path("build/trace.hash").read_text().strip(),
+              env_hash=Path("build/env.hash").read_text().strip(),
+              ci_run_id="${{ github.run_id }}",
           )
 
-          Path('build/attestation.hash').write_text(
+          Path("build/attestation.hash").write_text(
               compute_attestation_hash(att)
           )
           PY
 
-      # --------------------------------------------------------
-      # Upload artifacts
-      # --------------------------------------------------------
       - uses: actions/upload-artifact@v4
         with:
           name: afritech-build
@@ -169,29 +185,33 @@ jobs:
 
 
 # ============================================================
-# JOB 4 — HYGIENE
+# JOB 4 — HYGIENE (STRUCTURAL, NON‑SEMANTIC)
 # ============================================================
   hygiene:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: governance
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
-      - run: |
-          python3 afritech/tools/afritech_lint.py \
+      - name: Structural hygiene check
+        run: |
+          python afritech/tools/afritech_lint.py \
             --root afritech \
             --format text
 
 
 # ============================================================
-# JOB 5 — SNAPSHOT + INTEGRITY
+# JOB 5 — SNAPSHOT + INTEGRITY (REPLAY & STABILITY)
 # ============================================================
   snapshot:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: hygiene
 
     steps:
@@ -202,60 +222,63 @@ jobs:
           name: afritech-build
           path: build/
 
-      # Snapshot
-      - run: |
-          python3 afritech/tools/afritech_lint.py \
+      - name: Snapshot lint state
+        run: |
+          python afritech/tools/afritech_lint.py \
             --root afritech \
             --format json > lint.json
 
-      # Snapshot validation
-      - run: |
-          python3 - <<'PY'
+      - name: Validate snapshot stability
+        run: |
+          python - <<'PY'
           import json
 
-          cur = json.load(open('lint.json'))
-          base = json.load(open('afritech/governance/snapshots/lint.snapshot.json'))
+          cur = json.load(open("lint.json"))
+          base = json.load(open("afritech/governance/snapshots/lint.snapshot.json"))
 
           if (cur.get("score"), cur.get("total")) != (base.get("score"), base.get("total")):
-              raise SystemExit("❌ Snapshot drift")
+              raise SystemExit("❌ Snapshot drift detected")
 
-          print("✅ Snapshot OK")
+          print("✅ Snapshot stable")
           PY
 
-      # Trace replay validation
-      - run: |
-          python3 - <<'PY'
-          from afritech.governance.runtime.trace_replay_validator import validate_trace_replay
+      - name: Validate trace replay
+        run: |
+          python - <<'PY'
           import json
+          from afritech.governance.runtime.trace_replay_validator import validate_trace_replay
 
-          trace = json.loads(open('build/trace.json').read())
-          expected = open('build/trace.hash').read().strip()
+          trace = json.loads(open("build/trace.json").read())
+          expected = open("build/trace.hash").read().strip()
 
           validate_trace_replay(trace, expected)
           PY
 
-      # Attestation validation
-      - run: |
-          python3 - <<'PY'
+      - name: Validate execution attestation
+        run: |
+          python - <<'PY'
+          from pathlib import Path
           from afritech.governance.runtime.execution_attestation import (
               ExecutionAttestation,
-              validate_attestation
+              validate_attestation,
           )
-          from pathlib import Path
 
           att = ExecutionAttestation(
-              manifest_hash=Path('build/manifest.hash').read_text().strip(),
-              trace_hash=Path('build/trace.hash').read_text().strip(),
-              env_hash=Path('build/env.hash').read_text().strip(),
-              ci_run_id="${{ github.run_id }}"
+              manifest_hash=Path("build/manifest.hash").read_text().strip(),
+              trace_hash=Path("build/trace.hash").read_text().strip(),
+              env_hash=Path("build/env.hash").read_text().strip(),
+              ci_run_id="${{ github.run_id }}",
           )
 
-          validate_attestation(att, Path('build/attestation.hash').read_text().strip())
+          validate_attestation(
+              att,
+              Path("build/attestation.hash").read_text().strip(),
+          )
           PY
 
 
 # ============================================================
-# JOB 6 — SUMMARY
+# JOB 6 — SUMMARY (COURT VERDICT)
 # ============================================================
   summary:
     runs-on: ubuntu-latest
@@ -265,11 +288,11 @@ jobs:
     steps:
       - run: |
           echo "=============================================="
-          echo "✅ AfriTech CI PASSED"
-          echo "✔ Constitution"
-          echo "✔ Core"
-          echo "✔ Governance"
-          echo "✔ Trace verified"
-          echo "✔ Attestation verified"
+          echo "✅ AfriTech CI — CONSTITUTIONAL PASS"
+          echo "✔ Constitution verified"
+          echo "✔ Core semantics verified"
+          echo "✔ Governance enforced"
+          echo "✔ Trace replay verified"
+          echo "✔ Execution attested"
           echo "✔ Snapshot stable"
           echo "=============================================="

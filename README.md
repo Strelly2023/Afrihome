@@ -9,3 +9,12 @@
 > in CI and pre-commit.
 
 universal platform
+## Governance
+
+Governance is enforced automatically using AfriTech.
+
+- Rules live in `/rules`
+- Enforcement lives in `/afritech/guards`
+- Execution via `afritech check`
+- CI is the final authority
+``
