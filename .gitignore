@@ -30,3 +30,26 @@ arch_report.json
 .lint-arch.json
 all_python_files.txt
 afrihome*.txt
+
+# Backup / scratch
+*Backup*.txt
+*Back*.txt
+*Snapshot*.txt
+*V1*.txt
+*V2*.txt
+*V3*.txt
+ADR_RULE*.txt
+
+# --- Runtime / execution artifacts ---
+afritech/run/
+afritech/execution_state/
+afritech/execution_manifest/
+afritech/replay_vm/
+
+# --- Quarantine / legacy ---
+_quarantine/
+legacy_checks/
+legacy_tools/
+scripts/
+tmp_*
+
